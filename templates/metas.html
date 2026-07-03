@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% block title %}Metas — FinançasPro{% endblock %}
+{% block topbar_title %}Metas{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Metas Mensais</h1>
+    <p class="page-sub">Defina limites e acompanhe seus objetivos</p>
+  </div>
+  <div class="header-controls">
+    <select id="sel-mes" class="select-pill">
+      {% for m in range(1,13) %}
+      <option value="{{ m }}" {% if m == mes_atual %}selected{% endif %}>
+        {{ ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][m-1] }}
+      </option>
+      {% endfor %}
+    </select>
+    <select id="sel-ano" class="select-pill">
+      {% for a in range(ano_atual-1, ano_atual+2) %}
+      <option value="{{ a }}" {% if a == ano_atual %}selected{% endif %}>{{ a }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</div>
+
+<!-- ── FORM DE META ───────────────────────── -->
+<div class="card glass meta-form-card">
+  <h2 class="section-title">Configurar Meta</h2>
+  <form id="form-meta" onsubmit="salvarMeta(event)">
+    <div class="form-row">
+      <div class="form-group">
+        <label>Limite de Gastos (R$)</label>
+        <input type="number" id="m-limite" class="form-input" step="0.01" min="0" placeholder="Ex: 3000,00">
+        <span class="form-hint">Alerta quando os gastos ultrapassarem este valor</span>
+      </div>
+      <div class="form-group">
+        <label>Meta de Receita (R$)</label>
+        <input type="number" id="m-receita" class="form-input" step="0.01" min="0" placeholder="Ex: 5000,00">
+        <span class="form-hint">Objetivo de receita total no mês</span>
+      </div>
+    </div>
+    <button type="submit" class="btn btn-primary">Salvar Meta</button>
+  </form>
+</div>
+
+<!-- ── PROGRESS CARDS ─────────────────────── -->
+<div class="cards-grid">
+
+  <!-- Gastos vs Limite -->
+  <div class="card glass prog-card" id="card-gastos">
+    <div class="prog-header">
+      <div>
+        <div class="card-label">Controle de Gastos</div>
+        <div class="prog-values">
+          <span class="prog-atual" id="g-atual">R$ —</span>
+          <span class="prog-sep">de</span>
+          <span class="prog-meta" id="g-limite">R$ —</span>
+        </div>
+      </div>
+      <div class="prog-icon" id="g-icon">💸</div>
+    </div>
+    <div class="progress-bar fat">
+      <div class="progress-fill" id="pb-gastos" style="width:0%"></div>
+    </div>
+    <div class="prog-footer">
+      <span id="g-pct" class="prog-pct">0%</span>
+      <span id="g-status" class="prog-status">do limite utilizado</span>
+    </div>
+    <div id="g-alerta" class="alerta-box hidden">
+      ⚠️ Limite de gastos ultrapassado!
+    </div>
+  </div>
+
+  <!-- Receita vs Meta -->
+  <div class="card glass prog-card" id="card-receita">
+    <div class="prog-header">
+      <div>
+        <div class="card-label">Meta de Receita</div>
+        <div class="prog-values">
+          <span class="prog-atual green" id="r-atual">R$ —</span>
+          <span class="prog-sep">de</span>
+          <span class="prog-meta" id="r-meta">R$ —</span>
+        </div>
+      </div>
+      <div class="prog-icon">🎯</div>
+    </div>
+    <div class="progress-bar fat">
+      <div class="progress-fill green-fill" id="pb-receita" style="width:0%"></div>
+    </div>
+    <div class="prog-footer">
+      <span id="r-pct" class="prog-pct green">0%</span>
+      <span id="r-status" class="prog-status">da meta atingida</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── SALDO DO MÊS ──────────────────────── -->
+<div class="card glass saldo-resumo-card">
+  <h2 class="section-title">Resumo do Mês</h2>
+  <div class="saldo-grid">
+    <div class="saldo-item">
+      <span class="saldo-label">Receitas</span>
+      <span class="saldo-val green" id="s-rec">R$ —</span>
+    </div>
+    <div class="saldo-divider"></div>
+    <div class="saldo-item">
+      <span class="saldo-label">Despesas</span>
+      <span class="saldo-val red" id="s-desp">R$ —</span>
+    </div>
+    <div class="saldo-divider"></div>
+    <div class="saldo-item">
+      <span class="saldo-label">Saldo Líquido</span>
+      <span class="saldo-val" id="s-saldo">R$ —</span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+async function carregarMeta() {
+  const mes = document.getElementById('sel-mes').value;
+  const ano = document.getElementById('sel-ano').value;
+
+  const dados = await fetch(`/api/metas?mes=${mes}&ano=${ano}`).then(r=>r.json());
+
+  // Preenche form
+  document.getElementById('m-limite').value  = dados.limite_gastos || '';
+  document.getElementById('m-receita').value = dados.meta_receita  || '';
+
+  // Card gastos
+  const desp  = dados.despesas_atuais  || 0;
+  const lim   = dados.limite_gastos    || 0;
+  const rec   = dados.receitas_atuais  || 0;
+  const metaR = dados.meta_receita     || 0;
+
+  document.getElementById('g-atual').textContent  = fmt(desp);
+  document.getElementById('g-limite').textContent = lim > 0 ? fmt(lim) : 'Não definido';
+
+  const pctG = lim > 0 ? Math.min((desp/lim*100),100) : 0;
+  const pbG  = document.getElementById('pb-gastos');
+  pbG.style.width = pctG + '%';
+  pbG.className = 'progress-fill' + (dados.alerta_limite ? ' danger' : '');
+  document.getElementById('g-pct').textContent = pctG.toFixed(1) + '%';
+  document.getElementById('g-alerta').classList.toggle('hidden', !dados.alerta_limite);
+
+  // Card receita
+  document.getElementById('r-atual').textContent = fmt(rec);
+  document.getElementById('r-meta').textContent  = metaR > 0 ? fmt(metaR) : 'Não definida';
+  const pctR = metaR > 0 ? Math.min((rec/metaR*100),100) : 0;
+  document.getElementById('pb-receita').style.width = pctR + '%';
+  document.getElementById('r-pct').textContent = pctR.toFixed(1) + '%';
+
+  // Resumo do mês
+  const resumo = await fetch(`/api/dashboard/resumo?mes=${mes}&ano=${ano}`).then(r=>r.json());
+  document.getElementById('s-rec').textContent   = fmt(resumo.receitas);
+  document.getElementById('s-desp').textContent  = fmt(resumo.despesas);
+  const saldoEl = document.getElementById('s-saldo');
+  saldoEl.textContent = fmt(resumo.saldo);
+  saldoEl.className = 'saldo-val ' + (resumo.saldo >= 0 ? 'green' : 'red');
+}
+
+async function salvarMeta(e) {
+  e.preventDefault();
+  const mes = document.getElementById('sel-mes').value;
+  const ano = document.getElementById('sel-ano').value;
+
+  const res = await fetch('/api/metas', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mes: +mes, ano: +ano,
+      limite_gastos: +document.getElementById('m-limite').value || 0,
+      meta_receita:  +document.getElementById('m-receita').value || 0,
+    })
+  });
+
+  if (res.ok) {
+    showToast('Meta salva com sucesso!', 'success');
+    carregarMeta();
+  } else {
+    showToast('Erro ao salvar meta.', 'error');
+  }
+}
+
+document.getElementById('sel-mes').addEventListener('change', carregarMeta);
+document.getElementById('sel-ano').addEventListener('change', carregarMeta);
+carregarMeta();
+</script>
+{% endblock %}

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}FinançasPro{% endblock %}</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+  <!-- Main CSS -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+
+  {% block extra_head %}{% endblock %}
+</head>
+<body>
+
+  <!-- ── SIDEBAR ─────────────────────────────────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <span class="logo-icon">◈</span>
+      <span class="logo-text">Finanças<strong>Pro</strong></span>
+    </div>
+
+    <nav class="sidebar-nav">
+      <a href="/" class="nav-item {% if request.path == '/' %}active{% endif %}">
+        <span class="nav-icon">⬡</span>
+        <span>Dashboard</span>
+      </a>
+      <a href="/transacoes" class="nav-item {% if request.path == '/transacoes' %}active{% endif %}">
+        <span class="nav-icon">⇄</span>
+        <span>Transações</span>
+      </a>
+      <a href="/extrato" class="nav-item {% if request.path == '/extrato' %}active{% endif %}">
+        <span class="nav-icon">☰</span>
+        <span>Extrato</span>
+      </a>
+      <a href="/metas" class="nav-item {% if request.path == '/metas' %}active{% endif %}">
+        <span class="nav-icon">◎</span>
+        <span>Metas</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="user-pill">
+        <div class="user-avatar">U</div>
+        <span>Usuário</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ── MOBILE TOPBAR ─────────────────────────── -->
+  <header class="topbar">
+    <button class="menu-toggle" onclick="toggleSidebar()">☰</button>
+    <span class="topbar-title">{% block topbar_title %}FinançasPro{% endblock %}</span>
+  </header>
+
+  <!-- ── MAIN CONTENT ──────────────────────────── -->
+  <main class="main-content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <!-- ── TOAST NOTIFICATION ────────────────────── -->
+  <div class="toast" id="toast"></div>
+
+  <!-- ── OVERLAY (mobile) ──────────────────────── -->
+  <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
+
+  <!-- Main JS -->
+  <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+  {% block extra_scripts %}{% endblock %}
+</body>
+</html>

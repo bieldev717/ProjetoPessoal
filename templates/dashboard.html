@@ -1,0 +1,289 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — FinançasPro{% endblock %}
+{% block topbar_title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Dashboard</h1>
+    <p class="page-sub">Visão geral do mês de <span id="mes-label">...</span></p>
+  </div>
+  <div class="header-controls">
+    <select id="sel-mes" class="select-pill">
+      {% for m in range(1,13) %}
+      <option value="{{ m }}" {% if m == mes_atual %}selected{% endif %}>
+        {{ ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][m-1] }}
+      </option>
+      {% endfor %}
+    </select>
+    <select id="sel-ano" class="select-pill">
+      {% for a in range(ano_atual-2, ano_atual+1) %}
+      <option value="{{ a }}" {% if a == ano_atual %}selected{% endif %}>{{ a }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</div>
+
+<!-- ── CARDS ─────────────────────────────────── -->
+<div class="cards-grid">
+  <div class="card card-saldo glass">
+    <div class="card-label">Saldo do Mês</div>
+    <div class="card-value" id="val-saldo">R$ —</div>
+    <div class="card-trend" id="trend-saldo"></div>
+    <div class="card-glow saldo-glow"></div>
+  </div>
+
+  <div class="card card-receita glass">
+    <div class="card-label">Total de Receitas</div>
+    <div class="card-value green" id="val-receitas">R$ —</div>
+    <div class="card-sub" id="sub-receitas">↑ este mês</div>
+    <div class="card-glow receita-glow"></div>
+  </div>
+
+  <div class="card card-despesa glass">
+    <div class="card-label">Total de Despesas</div>
+    <div class="card-value red" id="val-despesas">R$ —</div>
+    <div class="card-sub" id="sub-despesas">↓ este mês</div>
+    <div class="card-glow despesa-glow"></div>
+  </div>
+
+  <div class="card card-meta glass">
+    <div class="card-label">Limite de Gastos</div>
+    <div class="card-value" id="val-limite">—</div>
+    <div class="progress-wrap">
+      <div class="progress-bar">
+        <div class="progress-fill" id="prog-gastos" style="width:0%"></div>
+      </div>
+      <span class="progress-pct" id="pct-gastos">0%</span>
+    </div>
+    <div class="card-glow meta-glow"></div>
+  </div>
+</div>
+
+<!-- ── CHART + CATEGORIAS ─────────────────── -->
+<div class="bottom-grid">
+
+  <div class="card glass chart-card">
+    <div class="card-header-row">
+      <h2 class="section-title">Evolução dos Últimos 6 Meses</h2>
+      <div class="legend-row">
+        <span class="leg leg-green">Receitas</span>
+        <span class="leg leg-red">Despesas</span>
+        <span class="leg leg-blue">Saldo</span>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="chartEvolucao"></canvas>
+    </div>
+  </div>
+
+  <div class="card glass cat-card">
+    <h2 class="section-title">Gastos por Categoria</h2>
+    <div id="cat-list" class="cat-list">
+      <p class="empty-msg">Carregando...</p>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── ÚLTIMAS TRANSAÇÕES ────────────────── -->
+<div class="card glass mt-card">
+  <div class="card-header-row">
+    <h2 class="section-title">Últimas Transações</h2>
+    <a href="/transacoes" class="btn btn-ghost btn-sm">Ver todas →</a>
+  </div>
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Descrição</th>
+          <th>Categoria</th>
+          <th>Data</th>
+          <th>Valor</th>
+        </tr>
+      </thead>
+      <tbody id="recent-tbody">
+        <tr><td colspan="4" class="empty-msg">Carregando...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+const MES_NAMES = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+                   "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+let chartEv = null;
+
+function getMesAno() {
+  return {
+    mes: +document.getElementById('sel-mes').value,
+    ano: +document.getElementById('sel-ano').value
+  };
+}
+
+async function carregarResumo() {
+  const { mes, ano } = getMesAno();
+  document.getElementById('mes-label').textContent = MES_NAMES[mes-1] + ' ' + ano;
+  const r = await fetch(`/api/dashboard/resumo?mes=${mes}&ano=${ano}`).then(r=>r.json());
+
+  document.getElementById('val-saldo').textContent = fmt(r.saldo);
+  document.getElementById('val-saldo').className = 'card-value ' + (r.saldo >= 0 ? 'green' : 'red');
+  document.getElementById('val-receitas').textContent = fmt(r.receitas);
+  document.getElementById('val-despesas').textContent = fmt(r.despesas);
+
+  if (r.limite_gastos > 0) {
+    document.getElementById('val-limite').textContent = fmt(r.limite_gastos);
+    document.getElementById('prog-gastos').style.width = r.progresso_gastos + '%';
+    document.getElementById('prog-gastos').className = 'progress-fill' + (r.alerta_limite ? ' danger' : '');
+    document.getElementById('pct-gastos').textContent = r.progresso_gastos + '%';
+  } else {
+    document.getElementById('val-limite').textContent = 'Não definido';
+  }
+}
+
+async function carregarEvolucao() {
+  const dados = await fetch('/api/dashboard/evolucao').then(r=>r.json());
+  const labels = dados.map(d=>d.label);
+  const ctx = document.getElementById('chartEvolucao').getContext('2d');
+
+  if (chartEv) chartEv.destroy();
+  chartEv = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Receitas',
+          data: dados.map(d=>d.receitas),
+          backgroundColor: 'rgba(110,231,183,0.25)',
+          borderColor: '#6ee7b7',
+          borderWidth: 2,
+          borderRadius: 6,
+          order: 2
+        },
+        {
+          label: 'Despesas',
+          data: dados.map(d=>d.despesas),
+          backgroundColor: 'rgba(248,113,113,0.25)',
+          borderColor: '#f87171',
+          borderWidth: 2,
+          borderRadius: 6,
+          order: 2
+        },
+        {
+          label: 'Saldo',
+          data: dados.map(d=>d.saldo),
+          type: 'line',
+          borderColor: '#60a5fa',
+          backgroundColor: 'rgba(96,165,250,0.08)',
+          borderWidth: 2.5,
+          pointBackgroundColor: '#60a5fa',
+          pointRadius: 4,
+          tension: 0.4,
+          fill: true,
+          order: 1
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1a1f2e',
+          borderColor: 'rgba(255,255,255,0.1)',
+          borderWidth: 1,
+          callbacks: {
+            label: ctx => ` ${ctx.dataset.label}: ${fmt(ctx.raw)}`
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(255,255,255,0.04)' },
+          ticks: { color: '#94a3b8', font: { family: 'DM Sans' } }
+        },
+        y: {
+          grid: { color: 'rgba(255,255,255,0.04)' },
+          ticks: {
+            color: '#94a3b8',
+            font: { family: 'DM Sans' },
+            callback: v => 'R$' + (v>=1000 ? (v/1000).toFixed(1)+'k' : v)
+          }
+        }
+      }
+    }
+  });
+}
+
+async function carregarCategorias() {
+  const { mes, ano } = getMesAno();
+  const dados = await fetch(`/api/relatorio/categorias?mes=${mes}&ano=${ano}&tipo=saida`).then(r=>r.json());
+  const el = document.getElementById('cat-list');
+
+  if (!dados.length) {
+    el.innerHTML = '<p class="empty-msg">Sem gastos este mês</p>';
+    return;
+  }
+
+  const max = dados[0].total;
+  el.innerHTML = dados.map(d => `
+    <div class="cat-item">
+      <span class="cat-icon">${d.icone}</span>
+      <div class="cat-info">
+        <div class="cat-name-row">
+          <span class="cat-name">${d.nome}</span>
+          <span class="cat-val">${fmt(d.total)}</span>
+        </div>
+        <div class="progress-bar slim">
+          <div class="progress-fill" style="width:${(d.total/max*100).toFixed(1)}%;background:${d.cor}"></div>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function carregarRecentes() {
+  const { mes, ano } = getMesAno();
+  const dados = await fetch(`/api/transacoes?mes=${mes}&ano=${ano}&per_page=6`).then(r=>r.json());
+  const tbody = document.getElementById('recent-tbody');
+
+  if (!dados.items.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty-msg">Nenhuma transação este mês</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = dados.items.map(t => `
+    <tr>
+      <td>
+        <div class="td-desc">
+          <span class="tipo-dot ${t.tipo}"></span>
+          ${t.descricao}
+        </div>
+      </td>
+      <td>
+        <span class="cat-badge" style="border-color:${t.categoria_cor}20;color:${t.categoria_cor}">
+          ${t.categoria_icone} ${t.categoria_nome}
+        </span>
+      </td>
+      <td class="muted">${fmtData(t.data)}</td>
+      <td class="val-cell ${t.tipo}">${t.tipo==='entrada'?'+':'-'}${fmt(t.valor)}</td>
+    </tr>
+  `).join('');
+}
+
+async function carregarTudo() {
+  await Promise.all([carregarResumo(), carregarCategorias(), carregarRecentes()]);
+}
+
+document.getElementById('sel-mes').addEventListener('change', carregarTudo);
+document.getElementById('sel-ano').addEventListener('change', carregarTudo);
+
+carregarTudo();
+carregarEvolucao();
+</script>
+{% endblock %}
