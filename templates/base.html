@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Organize receitas, despesas, metas e orçamentos em um só lugar com o FinançasPro.">
+  <meta name="theme-color" content="#0d1117">
   <title>{% block title %}FinançasPro{% endblock %}</title>
 
   <!-- Fonts -->
@@ -42,6 +44,10 @@
       <a href="/metas" class="nav-item {% if request.path == '/metas' %}active{% endif %}">
         <span class="nav-icon">◎</span>
         <span>Metas</span>
+      </a>
+      <a href="/recorrencias" class="nav-item {% if request.path == '/recorrencias' %}active{% endif %}">
+        <span class="nav-icon">⟳</span>
+        <span>Recorrências</span>
       </a>
     </nav>
 

@@ -1,247 +1,97 @@
 {% extends "base.html" %}
 {% block title %}Transações — FinançasPro{% endblock %}
 {% block topbar_title %}Transações{% endblock %}
-
 {% block content %}
-<div class="page-header">
-  <div>
-    <h1 class="page-title">Transações</h1>
-    <p class="page-sub">Adicione e gerencie suas movimentações</p>
-  </div>
-  <button class="btn btn-primary" onclick="abrirModal()">+ Nova Transação</button>
-</div>
-
-<!-- ── FORMULÁRIO / MODAL ─────────────────── -->
+<div class="page-header"><div><h1 class="page-title">Transações</h1><p class="page-sub">Adicione e gerencie suas movimentações</p></div><button class="btn btn-primary" onclick="abrirModal()">+ Nova Transação</button></div>
 <div class="modal-backdrop" id="modalBackdrop" onclick="fecharModal()"></div>
-<div class="modal glass" id="modal">
-  <div class="modal-header">
-    <h2 class="modal-title" id="modal-title">Nova Transação</h2>
-    <button class="modal-close" onclick="fecharModal()">✕</button>
-  </div>
-
-  <div class="tipo-toggle">
-    <button class="tipo-btn active" id="btn-entrada" onclick="setTipo('entrada')">↑ Receita</button>
-    <button class="tipo-btn"        id="btn-saida"   onclick="setTipo('saida')">↓ Despesa</button>
-  </div>
-
+<div class="modal glass" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal-header"><h2 class="modal-title" id="modal-title">Nova Transação</h2><button class="modal-close" aria-label="Fechar" onclick="fecharModal()">×</button></div>
+  <div class="tipo-toggle"><button type="button" class="tipo-btn active" id="btn-entrada" onclick="setTipo('entrada')">↑ Receita</button><button type="button" class="tipo-btn" id="btn-saida" onclick="setTipo('saida')">↓ Despesa</button></div>
   <form id="form-transacao" onsubmit="salvarTransacao(event)">
-    <input type="hidden" id="edit-id" value="">
-    <input type="hidden" id="campo-tipo" value="entrada">
-
-    <div class="form-group">
-      <label>Descrição</label>
-      <input type="text" id="campo-descricao" class="form-input" placeholder="Ex: Mercado semanal" required>
-    </div>
-
-    <div class="form-row">
-      <div class="form-group">
-        <label>Valor (R$)</label>
-        <input type="number" id="campo-valor" class="form-input" step="0.01" min="0.01" placeholder="0,00" required>
-      </div>
-      <div class="form-group">
-        <label>Data</label>
-        <input type="date" id="campo-data" class="form-input" required>
-      </div>
-    </div>
-
-    <div class="form-group">
-      <label>Categoria</label>
-      <select id="campo-categoria" class="form-input">
-        <option value="">— Sem categoria —</option>
-        {% for c in categorias %}
-        <option value="{{ c.id }}" data-tipo="{{ c.tipo }}" data-icone="{{ c.icone }}">
-          {{ c.icone }} {{ c.nome }}
-        </option>
-        {% endfor %}
-      </select>
-    </div>
-
-    <div class="modal-actions">
-      <button type="button" class="btn btn-ghost" onclick="fecharModal()">Cancelar</button>
-      <button type="submit" class="btn btn-primary" id="btn-salvar">Salvar</button>
-    </div>
+    <input type="hidden" id="edit-id"><input type="hidden" id="campo-tipo" value="entrada">
+    <div class="form-group"><label for="campo-descricao">Descrição</label><input type="text" id="campo-descricao" class="form-input" maxlength="200" placeholder="Ex.: Mercado semanal" required></div>
+    <div class="form-row"><div class="form-group"><label for="campo-valor">Valor (R$)</label><input type="number" id="campo-valor" class="form-input" step="0.01" min="0.01" placeholder="0,00" required></div><div class="form-group"><label for="campo-data">Data</label><input type="date" id="campo-data" class="form-input" required></div></div>
+    <div class="form-group"><label for="campo-categoria">Categoria</label><select id="campo-categoria" class="form-input"><option value="">— Sem categoria —</option>{% for c in categorias %}<option value="{{ c.id }}" data-tipo="{{ c.tipo }}">{{ c.icone }} {{ c.nome }}</option>{% endfor %}</select></div>
+    <div class="modal-actions"><button type="button" class="btn btn-ghost" onclick="fecharModal()">Cancelar</button><button type="submit" class="btn btn-primary">Salvar</button></div>
   </form>
 </div>
-
-<!-- ── LISTA ──────────────────────────────── -->
-<div class="card glass">
-  <div class="card-header-row">
-    <h2 class="section-title">Histórico Recente</h2>
-    <div class="filter-row">
-      <select id="f-mes" class="select-pill">
-        {% for m in range(1,13) %}
-        <option value="{{ m }}" {% if m == mes_atual|default(1) %}selected{% endif %}>
-          {{ ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][m-1] }}
-        </option>
-        {% endfor %}
-      </select>
-      <select id="f-tipo" class="select-pill">
-        <option value="">Todos</option>
-        <option value="entrada">Receitas</option>
-        <option value="saida">Despesas</option>
-      </select>
-    </div>
-  </div>
-
-  <div class="table-wrap">
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>Descrição</th>
-          <th>Categoria</th>
-          <th>Data</th>
-          <th>Valor</th>
-          <th>Ações</th>
-        </tr>
-      </thead>
-      <tbody id="trans-tbody">
-        <tr><td colspan="5" class="empty-msg">Carregando...</td></tr>
-      </tbody>
-    </table>
-  </div>
-  <div class="pagination" id="paginacao"></div>
-</div>
+<div class="card glass"><div class="card-header-row"><h2 class="section-title">Histórico de transações</h2><div class="filter-row">
+  <label class="sr-only" for="f-busca">Buscar descrição</label><input id="f-busca" class="form-input search-input" type="search" placeholder="Buscar descrição…">
+  <label class="sr-only" for="f-mes">Mês</label><select id="f-mes" class="select-pill">{% for m in range(1,13) %}<option value="{{ m }}" {% if m == mes_atual %}selected{% endif %}>{{ ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"][m-1] }}</option>{% endfor %}</select>
+  <label class="sr-only" for="f-ano">Ano</label><select id="f-ano" class="select-pill">{% for a in range(ano_atual-2, ano_atual+2) %}<option value="{{ a }}" {% if a == ano_atual %}selected{% endif %}>{{ a }}</option>{% endfor %}</select>
+  <label class="sr-only" for="f-tipo">Tipo</label><select id="f-tipo" class="select-pill"><option value="">Todos</option><option value="entrada">Receitas</option><option value="saida">Despesas</option></select>
+</div></div>
+<div class="table-wrap"><table class="data-table"><thead><tr><th>Descrição</th><th>Categoria</th><th>Data</th><th>Valor</th><th>Ações</th></tr></thead><tbody id="trans-tbody"><tr><td colspan="5" class="empty-msg">Carregando…</td></tr></tbody></table></div><div class="pagination" id="paginacao"></div></div>
 {% endblock %}
-
 {% block extra_scripts %}
 <script>
-const MES_ATUAL = new Date().getMonth() + 1;
-const ANO_ATUAL = new Date().getFullYear();
 let paginaAtual = 1;
-
-// Inicializa campo de data com hoje
-document.getElementById('campo-data').value = new Date().toISOString().split('T')[0];
-document.getElementById('f-mes').value = MES_ATUAL;
-
+const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+const hojeLocal = () => { const agora = new Date(); return new Date(agora.getTime() - agora.getTimezoneOffset() * 60000).toISOString().slice(0, 10); };
+document.getElementById('campo-data').value = hojeLocal();
 function setTipo(tipo) {
   document.getElementById('campo-tipo').value = tipo;
-  document.getElementById('btn-entrada').classList.toggle('active', tipo==='entrada');
-  document.getElementById('btn-saida').classList.toggle('active', tipo==='saida');
-
-  // Filtra categorias pelo tipo
-  document.querySelectorAll('#campo-categoria option').forEach(opt => {
-    const t = opt.dataset.tipo;
-    opt.hidden = t && t !== tipo;
-  });
-  document.getElementById('campo-categoria').value = '';
+  document.getElementById('btn-entrada').classList.toggle('active', tipo === 'entrada');
+  document.getElementById('btn-saida').classList.toggle('active', tipo === 'saida');
+  document.querySelectorAll('#campo-categoria option').forEach(option => { option.hidden = Boolean(option.dataset.tipo && option.dataset.tipo !== tipo); });
+  if (document.querySelector('#campo-categoria option:checked')?.hidden) document.getElementById('campo-categoria').value = '';
 }
-
-function abrirModal(t=null) {
-  document.getElementById('modal-title').textContent = t ? 'Editar Transação' : 'Nova Transação';
-  document.getElementById('edit-id').value = t ? t.id : '';
-  document.getElementById('campo-descricao').value = t ? t.descricao : '';
-  document.getElementById('campo-valor').value = t ? t.valor : '';
-  document.getElementById('campo-data').value = t ? t.data : new Date().toISOString().split('T')[0];
-  document.getElementById('campo-categoria').value = t ? (t.categoria_id || '') : '';
-  setTipo(t ? t.tipo : 'entrada');
-
+function abrirModal(item = null) {
+  document.getElementById('modal-title').textContent = item ? 'Editar transação' : 'Nova transação';
+  document.getElementById('edit-id').value = item?.id ?? '';
+  document.getElementById('campo-descricao').value = item?.descricao ?? '';
+  document.getElementById('campo-valor').value = item?.valor ?? '';
+  document.getElementById('campo-data').value = item?.data ?? hojeLocal();
+  setTipo(item?.tipo ?? 'entrada');
+  document.getElementById('campo-categoria').value = item?.categoria_id ?? '';
   document.getElementById('modal').classList.add('open');
   document.getElementById('modalBackdrop').classList.add('open');
+  document.getElementById('campo-descricao').focus();
 }
-
 function fecharModal() {
   document.getElementById('modal').classList.remove('open');
   document.getElementById('modalBackdrop').classList.remove('open');
   document.getElementById('form-transacao').reset();
+  document.getElementById('edit-id').value = '';
+  setTipo('entrada');
 }
-
-async function salvarTransacao(e) {
-  e.preventDefault();
+async function salvarTransacao(event) {
+  event.preventDefault();
   const id = document.getElementById('edit-id').value;
-  const body = {
-    descricao: document.getElementById('campo-descricao').value,
-    valor: document.getElementById('campo-valor').value,
-    data: document.getElementById('campo-data').value,
-    tipo: document.getElementById('campo-tipo').value,
-    categoria_id: document.getElementById('campo-categoria').value || null,
-  };
-
-  const url = id ? `/api/transacoes/${id}` : '/api/transacoes';
-  const method = id ? 'PUT' : 'POST';
-
-  const res = await fetch(url, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-
-  if (res.ok) {
-    showToast(id ? 'Transação atualizada!' : 'Transação adicionada!', 'success');
-    fecharModal();
-    carregarTransacoes();
-  } else {
-    showToast('Erro ao salvar. Verifique os campos.', 'error');
-  }
+  const body = {descricao: document.getElementById('campo-descricao').value, valor: document.getElementById('campo-valor').value, data: document.getElementById('campo-data').value, tipo: document.getElementById('campo-tipo').value, categoria_id: document.getElementById('campo-categoria').value || null};
+  try {
+    const response = await fetch(id ? `/api/transacoes/${id}` : '/api/transacoes', {method: id ? 'PUT' : 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.erro || 'Não foi possível salvar a transação.');
+    showToast(id ? 'Transação atualizada.' : 'Transação adicionada.', 'success'); fecharModal(); carregarTransacoes();
+  } catch (error) { showToast(error.message, 'error'); }
 }
-
 async function editarTransacao(id) {
-  const t = await fetch(`/api/transacoes/${id}`).then(r=>r.json());
-  abrirModal(t);
+  try { const response = await fetch(`/api/transacoes/${id}`); const item = await response.json(); if (!response.ok) throw new Error(item.erro); abrirModal(item); }
+  catch (error) { showToast(error.message || 'Não foi possível carregar a transação.', 'error'); }
 }
-
 async function deletarTransacao(id) {
   if (!confirm('Excluir esta transação?')) return;
-  const res = await fetch(`/api/transacoes/${id}`, { method: 'DELETE' });
-  if (res.ok) {
-    showToast('Transação excluída.', 'success');
-    carregarTransacoes();
-  }
+  const response = await fetch(`/api/transacoes/${id}`, {method:'DELETE'});
+  if (response.ok) { showToast('Transação excluída.', 'success'); carregarTransacoes(); }
+  else showToast('Não foi possível excluir a transação.', 'error');
 }
-
-async function carregarTransacoes(page=1) {
+async function carregarTransacoes(page = 1) {
   paginaAtual = page;
-  const mes = document.getElementById('f-mes').value;
-  const tipo = document.getElementById('f-tipo').value;
-  const ano = ANO_ATUAL;
-
-  const params = new URLSearchParams({ mes, ano, per_page: 15, page });
-  if (tipo) params.set('tipo', tipo);
-
-  const dados = await fetch(`/api/transacoes?${params}`).then(r=>r.json());
-  const tbody = document.getElementById('trans-tbody');
-
-  if (!dados.items.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty-msg">Nenhuma transação encontrada</td></tr>';
-    document.getElementById('paginacao').innerHTML = '';
-    return;
-  }
-
-  tbody.innerHTML = dados.items.map(t => `
-    <tr>
-      <td>
-        <div class="td-desc">
-          <span class="tipo-dot ${t.tipo}"></span>
-          ${t.descricao}
-        </div>
-      </td>
-      <td>
-        <span class="cat-badge" style="border-color:${t.categoria_cor}30;color:${t.categoria_cor}">
-          ${t.categoria_icone} ${t.categoria_nome}
-        </span>
-      </td>
-      <td class="muted">${fmtData(t.data)}</td>
-      <td class="val-cell ${t.tipo}">${t.tipo==='entrada'?'+':'-'}${fmt(t.valor)}</td>
-      <td>
-        <div class="action-btns">
-          <button class="btn-icon" title="Editar" onclick="editarTransacao(${t.id})">✎</button>
-          <button class="btn-icon danger" title="Excluir" onclick="deletarTransacao(${t.id})">✕</button>
-        </div>
-      </td>
-    </tr>
-  `).join('');
-
-  // Paginação
-  const pag = document.getElementById('paginacao');
-  if (dados.pages <= 1) { pag.innerHTML = ''; return; }
-  let html = '';
-  for (let i=1; i<=dados.pages; i++) {
-    html += `<button class="pag-btn ${i===page?'active':''}" onclick="carregarTransacoes(${i})">${i}</button>`;
-  }
-  pag.innerHTML = html;
+  const params = new URLSearchParams({mes: document.getElementById('f-mes').value, ano: document.getElementById('f-ano').value, per_page:'15', page:String(page)});
+  const tipo = document.getElementById('f-tipo').value, busca = document.getElementById('f-busca').value.trim();
+  if (tipo) params.set('tipo', tipo); if (busca) params.set('q', busca);
+  try {
+    const response = await fetch(`/api/transacoes?${params}`), dados = await response.json();
+    if (!response.ok) throw new Error(dados.erro || 'Erro ao carregar transações.');
+    const tbody = document.getElementById('trans-tbody');
+    if (!dados.items.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty-msg">Nenhuma transação encontrada</td></tr>'; document.getElementById('paginacao').innerHTML = ''; return; }
+    tbody.innerHTML = dados.items.map(item => `<tr><td><div class="td-desc"><span class="tipo-dot ${item.tipo}"></span>${escapeHtml(item.descricao)}</div></td><td><span class="cat-badge">${escapeHtml(item.categoria_icone)} ${escapeHtml(item.categoria_nome)}</span></td><td class="muted">${fmtData(item.data)}</td><td class="val-cell ${item.tipo}">${item.tipo==='entrada'?'+':'−'}${fmt(item.valor)}</td><td><div class="action-btns"><button class="btn-icon" title="Editar" aria-label="Editar ${escapeHtml(item.descricao)}" onclick="editarTransacao(${item.id})">✎</button><button class="btn-icon danger" title="Excluir" aria-label="Excluir ${escapeHtml(item.descricao)}" onclick="deletarTransacao(${item.id})">×</button></div></td></tr>`).join('');
+    document.getElementById('paginacao').innerHTML = dados.pages > 1 ? Array.from({length: dados.pages}, (_, i) => i + 1).map(num => `<button class="pag-btn ${num===page?'active':''}" aria-label="Página ${num}" onclick="carregarTransacoes(${num})">${num}</button>`).join('') : '';
+  } catch (error) { showToast(error.message, 'error'); }
 }
-
-document.getElementById('f-mes').addEventListener('change', () => carregarTransacoes(1));
-document.getElementById('f-tipo').addEventListener('change', () => carregarTransacoes(1));
+['f-mes','f-ano','f-tipo'].forEach(id => document.getElementById(id).addEventListener('change', () => carregarTransacoes(1)));
+document.getElementById('f-busca').addEventListener('input', debounce(() => carregarTransacoes(1), 250));
 carregarTransacoes();
 </script>
 {% endblock %}

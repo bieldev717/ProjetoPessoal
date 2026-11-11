@@ -16,6 +16,14 @@ function fmt(valor) {
   });
 }
 
+function safeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
+}
+
+function safeColor(value) {
+  return /^#[0-9a-f]{3,8}$/i.test(String(value ?? '')) ? value : '#6ee7b7';
+}
+
 /**
  * Formata data ISO (2024-05-28) para exibição (28/05/2024)
  */
@@ -94,6 +102,14 @@ document.addEventListener('keydown', e => {
 });
 
 // ── HELPERS ──────────────────────────────────
+
+function safeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+
+function safeColor(value) {
+  return /^#[0-9a-f]{6}$/i.test(String(value)) ? value : '#94a3b8';
+}
 
 /**
  * Debounce simples

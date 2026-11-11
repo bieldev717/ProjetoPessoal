@@ -60,6 +60,11 @@
   </div>
 </div>
 
+<div class="mini-cards comparison-cards" aria-live="polite">
+  <div class="mini-card"><span class="mini-label">Mês anterior · receitas</span><span class="mini-val" id="comparativo-rec">R$ —</span><span class="comparison-delta" id="delta-rec"></span></div>
+  <div class="mini-card"><span class="mini-label">Mês anterior · despesas</span><span class="mini-val" id="comparativo-desp">R$ —</span><span class="comparison-delta" id="delta-desp"></span></div>
+</div>
+
 <!-- ── CHART + CATEGORIAS ─────────────────── -->
 <div class="bottom-grid">
 
@@ -132,6 +137,14 @@ async function carregarResumo() {
   document.getElementById('val-saldo').className = 'card-value ' + (r.saldo >= 0 ? 'green' : 'red');
   document.getElementById('val-receitas').textContent = fmt(r.receitas);
   document.getElementById('val-despesas').textContent = fmt(r.despesas);
+  const comparativo = await fetch(`/api/relatorio/comparativo?mes=${mes}&ano=${ano}`).then(response => response.json());
+  if (comparativo.atual && comparativo.anterior) {
+    document.getElementById('comparativo-rec').textContent = fmt(comparativo.anterior.receitas);
+    document.getElementById('comparativo-desp').textContent = fmt(comparativo.anterior.despesas);
+    const variacao = (atual, anterior) => anterior > 0 ? `${((atual-anterior)/anterior*100).toFixed(1)}% em relação ao mês anterior` : 'Sem base de comparação anterior';
+    document.getElementById('delta-rec').textContent = variacao(comparativo.atual.receitas, comparativo.anterior.receitas);
+    document.getElementById('delta-desp').textContent = variacao(comparativo.atual.despesas, comparativo.anterior.despesas);
+  }
 
   if (r.limite_gastos > 0) {
     document.getElementById('val-limite').textContent = fmt(r.limite_gastos);
@@ -233,14 +246,14 @@ async function carregarCategorias() {
   const max = dados[0].total;
   el.innerHTML = dados.map(d => `
     <div class="cat-item">
-      <span class="cat-icon">${d.icone}</span>
+      <span class="cat-icon">${safeHtml(d.icone)}</span>
       <div class="cat-info">
         <div class="cat-name-row">
-          <span class="cat-name">${d.nome}</span>
+          <span class="cat-name">${safeHtml(d.nome)}</span>
           <span class="cat-val">${fmt(d.total)}</span>
         </div>
         <div class="progress-bar slim">
-          <div class="progress-fill" style="width:${(d.total/max*100).toFixed(1)}%;background:${d.cor}"></div>
+          <div class="progress-fill" style="width:${(d.total/max*100).toFixed(1)}%;background:${safeColor(d.cor)}"></div>
         </div>
       </div>
     </div>
@@ -262,12 +275,12 @@ async function carregarRecentes() {
       <td>
         <div class="td-desc">
           <span class="tipo-dot ${t.tipo}"></span>
-          ${t.descricao}
+          ${safeHtml(t.descricao)}
         </div>
       </td>
       <td>
-        <span class="cat-badge" style="border-color:${t.categoria_cor}20;color:${t.categoria_cor}">
-          ${t.categoria_icone} ${t.categoria_nome}
+        <span class="cat-badge" style="border-color:${safeColor(t.categoria_cor)}20;color:${safeColor(t.categoria_cor)}">
+          ${safeHtml(t.categoria_icone)} ${safeHtml(t.categoria_nome)}
         </span>
       </td>
       <td class="muted">${fmtData(t.data)}</td>
