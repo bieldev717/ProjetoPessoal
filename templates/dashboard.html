@@ -296,7 +296,9 @@ async function carregarTudo() {
 document.getElementById('sel-mes').addEventListener('change', carregarTudo);
 document.getElementById('sel-ano').addEventListener('change', carregarTudo);
 
-carregarTudo();
-carregarEvolucao();
+runWhenAuthenticated(() => {
+  carregarTudo();
+  carregarEvolucao();
+});
 </script>
 {% endblock %}

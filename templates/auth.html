@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0d1117">
+  <meta name="neon-auth-url" content="{{ neon_auth_url }}">
+  <meta name="description" content="Acesse sua conta FinançasPro para organizar suas finanças.">
+  <title>{{ "Criar conta" if mode == "register" else "Entrar" }} — FinançasPro</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="auth-page" data-auth-page="true" data-auth-mode="{{ mode }}">
+  <main class="auth-card glass" aria-labelledby="auth-title">
+    <a class="auth-brand" href="/" aria-label="FinançasPro início">
+      <span class="logo-icon" aria-hidden="true">◈</span>
+      <span class="logo-text">Finanças<strong>Pro</strong></span>
+    </a>
+    <p class="auth-eyebrow">SUAS FINANÇAS, SOB SEU CONTROLE</p>
+    <h1 id="auth-title">{{ "Crie sua conta" if mode == "register" else "Bem-vindo de volta" }}</h1>
+    <p class="auth-description">{{ "Comece a organizar seus objetivos e movimentações." if mode == "register" else "Entre para acessar suas finanças com segurança." }}</p>
+
+    <form id="auth-form" class="auth-form">
+      {% if mode == "register" %}
+      <div class="form-group">
+        <label for="auth-name">Nome</label>
+        <input class="form-input" id="auth-name" name="name" type="text" maxlength="100" autocomplete="name" required>
+      </div>
+      {% endif %}
+      <div class="form-group">
+        <label for="auth-email">E-mail</label>
+        <input class="form-input" id="auth-email" name="email" type="email" autocomplete="email" maxlength="254" required>
+      </div>
+      <div class="form-group">
+        <label for="auth-password">Senha</label>
+        <input class="form-input" id="auth-password" name="password" type="password" minlength="8" autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" required>
+        {% if mode == "register" %}<span class="form-hint">Use pelo menos 8 caracteres.</span>{% endif %}
+      </div>
+      {% if mode == "register" %}
+      <div class="form-group">
+        <label for="auth-confirm-password">Confirme a senha</label>
+        <input class="form-input" id="auth-confirm-password" name="confirm-password" type="password" minlength="8" autocomplete="new-password" required>
+      </div>
+      {% endif %}
+      <p id="auth-status" class="auth-status" role="status" aria-live="polite"></p>
+      <button id="auth-submit" class="btn btn-primary auth-submit" type="submit">{{ "Criar conta" if mode == "register" else "Entrar" }}</button>
+    </form>
+
+    <p class="auth-switch">
+      {{ "Já tem uma conta?" if mode == "register" else "Ainda não tem uma conta?" }}
+      <a data-auth-switch href="{{ '/login' if mode == 'register' else '/cadastro' }}">{{ "Entrar" if mode == "register" else "Criar conta" }}</a>
+    </p>
+  </main>
+  <script src="{{ url_for('static', filename='js/auth.js') }}"></script>
+</body>
+</html>

@@ -6,10 +6,16 @@ import math
 import os
 import secrets
 from datetime import date, datetime
+from functools import lru_cache
 from types import SimpleNamespace
+from urllib.parse import urlsplit
+from uuid import UUID
 
+import jwt
 from dateutil.relativedelta import relativedelta
-from flask import Flask, Response, current_app, jsonify, render_template, request
+from flask import Flask, Response, current_app, g, jsonify, render_template, request
+from jwt import PyJWKClient
+from jwt.exceptions import InvalidTokenError, PyJWKClientConnectionError, PyJWKClientError
 from sqlalchemy import and_, extract, func
 
 from neon_store import NeonStore
@@ -76,6 +82,76 @@ def _neon_store():
     return current_app.extensions.get("neon_store")
 
 
+@lru_cache(maxsize=4)
+def _jwks_client(jwks_url):
+    return PyJWKClient(jwks_url, cache_keys=True, timeout=5)
+
+
+def _neon_auth_base_url():
+    auth_url = str(current_app.config.get("NEON_AUTH_URL", "")).strip().rstrip("/")
+    parts = urlsplit(auth_url)
+    if parts.scheme not in {"https", "http"} or not parts.netloc or parts.query or parts.fragment:
+        raise ValueError("URL do Neon Auth inválida.")
+    if parts.scheme == "http" and parts.hostname not in {"localhost", "127.0.0.1"}:
+        raise ValueError("O Neon Auth deve usar HTTPS.")
+    return auth_url
+
+
+def _neon_auth_origin():
+    parts = urlsplit(_neon_auth_base_url())
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def _neon_jwks_url():
+    return f"{_neon_auth_base_url()}/.well-known/jwks.json"
+
+
+def _verificar_token_neon(token):
+    origin = _neon_auth_origin()
+    signing_key = _jwks_client(_neon_jwks_url()).get_signing_key_from_jwt(token)
+    claims = jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=["EdDSA"],
+        issuer=origin,
+        audience=origin,
+        options={"require": ["exp", "sub", "iss", "aud"]},
+    )
+    return UUID(claims["sub"]), claims.get("email", "")
+
+
+def _claim_legacy_records(user_id):
+    store = _neon_store()
+    if not store:
+        return
+
+    async def claim(connection):
+        if await connection.fetchval("SELECT owner_id FROM public.finance_legacy_claim WHERE singleton = 1"):
+            return
+        await connection.execute("SELECT pg_advisory_xact_lock(91600417)")
+        if await connection.fetchval("SELECT owner_id FROM public.finance_legacy_claim WHERE singleton = 1"):
+            return
+        first_user_id = await connection.fetchval(
+            'SELECT id FROM neon_auth."user" ORDER BY "createdAt" ASC, id ASC LIMIT 1'
+        )
+        if first_user_id != user_id:
+            return
+        claimed = await connection.fetchrow(
+            "INSERT INTO public.finance_legacy_claim (singleton, owner_id) VALUES (1, $1) "
+            "ON CONFLICT (singleton) DO NOTHING RETURNING owner_id",
+            user_id,
+        )
+        if not claimed:
+            return
+        for table in ("transacoes", "metas", "orcamentos_categoria", "recorrencias"):
+            await connection.execute(
+                f"UPDATE public.{table} SET user_id = $1 WHERE user_id IS NULL",
+                user_id,
+            )
+
+    store.transaction(claim)
+
+
 def _categorias(tipo=None):
     store = _neon_store()
     if store:
@@ -128,7 +204,10 @@ def _neon_transacao_dict(row):
 
 
 def _neon_get_transacao(transacao_id):
-    row = _neon_store().fetchrow(f"{_neon_transacao_select()} WHERE t.id = $1", transacao_id)
+    row = _neon_store().fetchrow(
+        f"{_neon_transacao_select()} WHERE t.id = $1 AND t.user_id = $2",
+        transacao_id, g.user_id,
+    )
     return _neon_transacao_dict(row) if row else None
 
 
@@ -147,12 +226,20 @@ def _neon_get_recorrencia(recorrencia_id):
                                          COALESCE(c.icone, '💰') AS categoria_icone,
                                          r.frequencia, r.proxima_data, r.ativa
                                   FROM recorrencias r LEFT JOIN categorias c ON c.id = r.categoria_id
-                                  WHERE r.id = $1""", recorrencia_id)
+                                  WHERE r.id = $1 AND r.user_id = $2""", recorrencia_id, g.user_id)
     return _neon_recorrencia_dict(row)
 
 
+def _sqlite_transacao(transacao_id):
+    return Transacao.query.filter_by(id=transacao_id, user_id=str(g.user_id)).first()
+
+
+def _sqlite_recorrencia(recorrencia_id):
+    return Recorrencia.query.filter_by(id=recorrencia_id, user_id=str(g.user_id)).first()
+
+
 def _neon_transacao_filtros():
-    conditions, values = [], []
+    conditions, values = ["t.user_id = $1"], [g.user_id]
 
     def add(expression, value):
         values.append(value)
@@ -198,6 +285,8 @@ def create_app(test_config=None):
         SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
         JSON_SORT_KEYS=False,
         USE_NEON=False,
+        NEON_AUTH_URL=os.environ.get("NEON_AUTH_BASE_URL") or os.environ.get("VITE_NEON_AUTH_URL", ""),
+        AUTH_TESTING=False,
     )
     if test_config:
         app.config.update(test_config)
@@ -222,9 +311,54 @@ def create_app(test_config=None):
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if request.path.startswith("/api/"):
+            response.headers.setdefault("Cache-Control", "no-store")
         if request.is_secure:
             response.headers.setdefault("Strict-Transport-Security", "max-age=63072000")
         return response
+
+    @app.before_request
+    def require_api_authentication():
+        if not request.path.startswith("/api/"):
+            return None
+
+        if current_app.testing and current_app.config.get("AUTH_TESTING"):
+            raw_user_id = request.headers.get(
+                "X-Test-User-ID", current_app.config.get("AUTH_TEST_USER_ID")
+            )
+            if not raw_user_id:
+                return _erro("Autenticação necessária.", 401)
+            try:
+                g.user_id = UUID(raw_user_id)
+            except (TypeError, ValueError):
+                return _erro("Sessão inválida. Entre novamente.", 401)
+            g.user_email = request.headers.get("X-Test-User-Email", "teste@exemplo.com")
+        else:
+            authorization = request.headers.get("Authorization", "")
+            scheme, _, token = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not token:
+                return _erro("Autenticação necessária.", 401)
+            try:
+                g.user_id, g.user_email = _verificar_token_neon(token)
+            except (InvalidTokenError, PyJWKClientError, TypeError, ValueError) as error:
+                if isinstance(error, PyJWKClientConnectionError):
+                    current_app.logger.warning("Neon Auth indisponível (%s)", type(error).__name__)
+                    return _erro("Serviço de autenticação temporariamente indisponível.", 503)
+                return _erro("Sessão inválida ou expirada. Entre novamente.", 401)
+            except Exception as error:
+                current_app.logger.warning("Falha ao validar sessão (%s)", type(error).__name__)
+                return _erro("Serviço de autenticação temporariamente indisponível.", 503)
+
+        try:
+            _claim_legacy_records(g.user_id)
+        except Exception as error:
+            current_app.logger.exception("Falha ao vincular dados financeiros antigos (%s)", type(error).__name__)
+            return _erro("Não foi possível abrir seus dados financeiros.", 503)
+        return None
+
+    @app.context_processor
+    def inject_neon_auth_url():
+        return {"neon_auth_url": current_app.config.get("NEON_AUTH_URL", "")}
 
     @app.errorhandler(HTTPException)
     def handle_http_error(error):
@@ -283,10 +417,15 @@ def _resumo_mes(mes, ano):
     store = _neon_store()
     if store:
         resultados = store.fetch(
-            "SELECT tipo, COALESCE(SUM(valor), 0)::float8 AS total FROM transacoes WHERE EXTRACT(MONTH FROM data) = $1 AND EXTRACT(YEAR FROM data) = $2 GROUP BY tipo",
-            mes, ano,
+            "SELECT tipo, COALESCE(SUM(valor), 0)::float8 AS total FROM transacoes "
+            "WHERE EXTRACT(MONTH FROM data) = $1 AND EXTRACT(YEAR FROM data) = $2 "
+            "AND user_id = $3 GROUP BY tipo",
+            mes, ano, g.user_id,
         )
-        meta = store.fetchrow("SELECT limite_gastos, meta_receita FROM metas WHERE mes = $1 AND ano = $2", mes, ano)
+        meta = store.fetchrow(
+            "SELECT limite_gastos, meta_receita FROM metas WHERE mes = $1 AND ano = $2 AND user_id = $3",
+            mes, ano, g.user_id,
+        )
         for row in resultados:
             totais[row["tipo"]] = round(float(row["total"] or 0), 2)
         limite = float(meta["limite_gastos"]) if meta else 0.0
@@ -294,12 +433,16 @@ def _resumo_mes(mes, ano):
     else:
         resultados = (
             db.session.query(Transacao.tipo, func.sum(Transacao.valor))
-            .filter(extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano)
+            .filter(
+                Transacao.user_id == str(g.user_id),
+                extract("month", Transacao.data) == mes,
+                extract("year", Transacao.data) == ano,
+            )
             .group_by(Transacao.tipo).all()
         )
         for tipo, total in resultados:
             totais[tipo] = round(total or 0, 2)
-        meta = Meta.query.filter_by(mes=mes, ano=ano).first()
+        meta = Meta.query.filter_by(mes=mes, ano=ano, user_id=str(g.user_id)).first()
         limite = meta.limite_gastos if meta else 0.0
         meta_receita = meta.meta_receita if meta else 0.0
     despesas, receitas = totais["saida"], totais["entrada"]
@@ -316,10 +459,20 @@ def _resumo_mes(mes, ano):
 app = create_app()
 
 
+@app.route("/login")
+def login_page():
+    return render_template("auth.html", mode="login")
+
+
+@app.route("/cadastro")
+def cadastro_page():
+    return render_template("auth.html", mode="register")
+
+
 @app.route("/")
 def dashboard():
     hoje = date.today()
-    return render_template("dashboard.html", resumo=_resumo_mes(hoje.month, hoje.year), categorias=_categorias(), mes_atual=hoje.month, ano_atual=hoje.year)
+    return render_template("dashboard.html", categorias=_categorias(), mes_atual=hoje.month, ano_atual=hoje.year)
 
 
 @app.route("/transacoes")
@@ -345,6 +498,11 @@ def recorrencias_page():
     return render_template("recorrencias.html", categorias=_categorias())
 
 
+@app.route("/api/auth/me")
+def api_auth_me():
+    return jsonify({"id": str(g.user_id), "email": g.user_email})
+
+
 @app.route("/api/dashboard/resumo")
 def api_resumo():
     try:
@@ -361,7 +519,7 @@ def api_evolucao():
 
 
 def _query_transacoes():
-    query = Transacao.query
+    query = Transacao.query.filter_by(user_id=str(g.user_id))
     mes, ano = _argumento_inteiro("mes"), _argumento_inteiro("ano")
     tipo, categoria_id = request.args.get("tipo", "").strip(), _argumento_inteiro("categoria_id")
     busca = request.args.get("q", "").strip()[:100]
@@ -471,9 +629,16 @@ def api_criar_transacao():
         data_transacao = _data_iso(dados.get("data"))
         categoria_id = _categoria_valida(dados.get("categoria_id"), tipo)
         if store:
-            row = store.fetchrow("INSERT INTO transacoes (descricao, valor, data, tipo, categoria_id) VALUES ($1, $2, $3, $4, $5) RETURNING id", descricao, valor, data_transacao, tipo, categoria_id)
+            row = store.fetchrow(
+                "INSERT INTO transacoes (descricao, valor, data, tipo, categoria_id, user_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                descricao, valor, data_transacao, tipo, categoria_id, g.user_id,
+            )
             return jsonify(_neon_get_transacao(row["id"])), 201
-        transacao = Transacao(descricao=descricao, valor=valor, data=data_transacao, tipo=tipo, categoria_id=categoria_id)
+        transacao = Transacao(
+            descricao=descricao, valor=valor, data=data_transacao, tipo=tipo,
+            categoria_id=categoria_id, user_id=str(g.user_id),
+        )
         db.session.add(transacao)
         db.session.commit()
         return jsonify(transacao.to_dict()), 201
@@ -485,7 +650,7 @@ def api_criar_transacao():
 @app.route("/api/transacoes/<int:tid>", methods=["GET"])
 def api_obter_transacao(tid):
     store = _neon_store()
-    item = _neon_get_transacao(tid) if store else db.session.get(Transacao, tid)
+    item = _neon_get_transacao(tid) if store else _sqlite_transacao(tid)
     if not item:
         return _erro("Transação não encontrada.", 404)
     return jsonify(item if store else item.to_dict())
@@ -493,7 +658,7 @@ def api_obter_transacao(tid):
 @app.route("/api/transacoes/<int:tid>", methods=["PUT"])
 def api_atualizar_transacao(tid):
     store = _neon_store()
-    item = _neon_get_transacao(tid) if store else db.session.get(Transacao, tid)
+    item = _neon_get_transacao(tid) if store else _sqlite_transacao(tid)
     if not item:
         return _erro("Transação não encontrada.", 404)
     try:
@@ -508,7 +673,11 @@ def api_atualizar_transacao(tid):
         data_transacao = _data_iso(dados["data"]) if "data" in dados else (date.fromisoformat(item["data"]) if store else item.data)
         categoria_id = _categoria_valida(dados.get("categoria_id", item["categoria_id"] if store else item.categoria_id), tipo)
         if store:
-            store.execute("UPDATE transacoes SET descricao = $1, tipo = $2, valor = $3, data = $4, categoria_id = $5 WHERE id = $6", descricao, tipo, valor, data_transacao, categoria_id, tid)
+            store.execute(
+                "UPDATE transacoes SET descricao = $1, tipo = $2, valor = $3, data = $4, categoria_id = $5 "
+                "WHERE id = $6 AND user_id = $7",
+                descricao, tipo, valor, data_transacao, categoria_id, tid, g.user_id,
+            )
             return jsonify(_neon_get_transacao(tid))
         item.descricao, item.tipo, item.valor, item.data, item.categoria_id = descricao, tipo, valor, data_transacao, categoria_id
         db.session.commit()
@@ -521,11 +690,11 @@ def api_atualizar_transacao(tid):
 @app.route("/api/transacoes/<int:tid>", methods=["DELETE"])
 def api_deletar_transacao(tid):
     store = _neon_store()
-    item = _neon_get_transacao(tid) if store else db.session.get(Transacao, tid)
+    item = _neon_get_transacao(tid) if store else _sqlite_transacao(tid)
     if not item:
         return _erro("Transação não encontrada.", 404)
     if store:
-        store.execute("DELETE FROM transacoes WHERE id = $1", tid)
+        store.execute("DELETE FROM transacoes WHERE id = $1 AND user_id = $2", tid, g.user_id)
     else:
         db.session.delete(item)
         db.session.commit()
@@ -574,10 +743,14 @@ def api_listar_metas():
         return _erro(str(error))
     store = _neon_store()
     if store:
-        meta = store.fetchrow("SELECT id, mes, ano, limite_gastos, meta_receita FROM metas WHERE mes = $1 AND ano = $2", mes, ano)
+        meta = store.fetchrow(
+            "SELECT id, mes, ano, limite_gastos, meta_receita FROM metas "
+            "WHERE mes = $1 AND ano = $2 AND user_id = $3",
+            mes, ano, g.user_id,
+        )
         resultado = dict(meta) if meta else {"mes": mes, "ano": ano, "limite_gastos": 0, "meta_receita": 0}
     else:
-        meta = Meta.query.filter_by(mes=mes, ano=ano).first()
+        meta = Meta.query.filter_by(mes=mes, ano=ano, user_id=str(g.user_id)).first()
         resultado = meta.to_dict() if meta else {"mes": mes, "ano": ano, "limite_gastos": 0, "meta_receita": 0}
     resumo = _resumo_mes(mes, ano)
     resultado.update({"despesas_atuais": resumo["despesas"], "receitas_atuais": resumo["receitas"], "progresso_gastos": resumo["progresso_gastos"], "progresso_receita": resumo["progresso_receita"], "alerta_limite": resumo["alerta_limite"]})
@@ -593,11 +766,17 @@ def api_salvar_meta():
         limite = _valor_positivo(dados.get("limite_gastos", 0), "limite", True)
         meta_receita = _valor_positivo(dados.get("meta_receita", 0), "meta de receita", True)
         if store:
-            meta = store.fetchrow("INSERT INTO metas (mes, ano, limite_gastos, meta_receita) VALUES ($1, $2, $3, $4) ON CONFLICT (mes, ano) DO UPDATE SET limite_gastos = EXCLUDED.limite_gastos, meta_receita = EXCLUDED.meta_receita RETURNING id, mes, ano, limite_gastos, meta_receita", mes, ano, limite, meta_receita)
+            meta = store.fetchrow(
+                "INSERT INTO metas (mes, ano, limite_gastos, meta_receita, user_id) "
+                "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id, mes, ano) DO UPDATE "
+                "SET limite_gastos = EXCLUDED.limite_gastos, meta_receita = EXCLUDED.meta_receita "
+                "RETURNING id, mes, ano, limite_gastos, meta_receita",
+                mes, ano, limite, meta_receita, g.user_id,
+            )
             return jsonify(dict(meta))
-        meta = Meta.query.filter_by(mes=mes, ano=ano).first()
+        meta = Meta.query.filter_by(mes=mes, ano=ano, user_id=str(g.user_id)).first()
         if not meta:
-            meta = Meta(mes=mes, ano=ano)
+            meta = Meta(mes=mes, ano=ano, user_id=str(g.user_id))
             db.session.add(meta)
         meta.limite_gastos, meta.meta_receita = limite, meta_receita
         db.session.commit()
@@ -620,11 +799,12 @@ def api_orcamentos_categoria():
                                FROM orcamentos_categoria o
                                JOIN categorias c ON c.id = o.categoria_id
                                LEFT JOIN transacoes t ON t.categoria_id = o.categoria_id AND t.tipo = 'saida'
+                                 AND t.user_id = o.user_id
                                  AND EXTRACT(MONTH FROM t.data) = $1 AND EXTRACT(YEAR FROM t.data) = $2
-                               WHERE o.mes = $1 AND o.ano = $2
-                               GROUP BY o.id, c.id, c.nome, c.icone, o.limite ORDER BY c.nome""", mes, ano)
+                               WHERE o.mes = $1 AND o.ano = $2 AND o.user_id = $3
+                               GROUP BY o.id, c.id, c.nome, c.icone, o.limite ORDER BY c.nome""", mes, ano, g.user_id)
         return jsonify([{"id": row["id"], "categoria_id": row["categoria_id"], "categoria_nome": row["categoria_nome"], "categoria_icone": row["categoria_icone"], "limite": float(row["limite"]), "gasto": round(float(row["gasto"]), 2), "progresso": round(float(row["gasto"]) / float(row["limite"]) * 100, 1), "alerta": float(row["gasto"]) >= float(row["limite"]) * 0.8, "ultrapassado": float(row["gasto"]) > float(row["limite"])} for row in linhas])
-    linhas = db.session.query(OrcamentoCategoria, func.coalesce(func.sum(Transacao.valor), 0)).select_from(OrcamentoCategoria).join(Categoria, Categoria.id == OrcamentoCategoria.categoria_id).outerjoin(Transacao, and_(Transacao.categoria_id == Categoria.id, Transacao.tipo == "saida", extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano)).filter(OrcamentoCategoria.mes == mes, OrcamentoCategoria.ano == ano).group_by(OrcamentoCategoria.id, Categoria.id, Categoria.nome, Categoria.icone).order_by(Categoria.nome).all()
+    linhas = db.session.query(OrcamentoCategoria, func.coalesce(func.sum(Transacao.valor), 0)).select_from(OrcamentoCategoria).join(Categoria, Categoria.id == OrcamentoCategoria.categoria_id).outerjoin(Transacao, and_(Transacao.categoria_id == Categoria.id, Transacao.user_id == str(g.user_id), Transacao.tipo == "saida", extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano)).filter(OrcamentoCategoria.mes == mes, OrcamentoCategoria.ano == ano, OrcamentoCategoria.user_id == str(g.user_id)).group_by(OrcamentoCategoria.id, Categoria.id, Categoria.nome, Categoria.icone).order_by(Categoria.nome).all()
     return jsonify([{"id": orc.id, "categoria_id": orc.categoria_id, "categoria_nome": orc.categoria.nome, "categoria_icone": orc.categoria.icone, "limite": orc.limite, "gasto": round(gasto, 2), "progresso": round(gasto / orc.limite * 100, 1) if orc.limite else 0, "alerta": gasto >= orc.limite * 0.8, "ultrapassado": gasto > orc.limite} for orc, gasto in linhas])
 
 @app.route("/api/orcamentos-categoria", methods=["POST"])
@@ -638,11 +818,21 @@ def api_salvar_orcamento_categoria():
             raise ValueError("Selecione uma categoria de despesa.")
         limite = _valor_positivo(dados.get("limite"), "limite")
         if store:
-            store.fetchrow("INSERT INTO orcamentos_categoria (categoria_id, mes, ano, limite) VALUES ($1, $2, $3, $4) ON CONFLICT (categoria_id, mes, ano) DO UPDATE SET limite = EXCLUDED.limite RETURNING id", categoria_id, mes, ano, limite)
+            store.fetchrow(
+                "INSERT INTO orcamentos_categoria (categoria_id, mes, ano, limite, user_id) "
+                "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (user_id, categoria_id, mes, ano) "
+                "DO UPDATE SET limite = EXCLUDED.limite RETURNING id",
+                categoria_id, mes, ano, limite, g.user_id,
+            )
             return jsonify({"ok": True})
-        orcamento = OrcamentoCategoria.query.filter_by(categoria_id=categoria_id, mes=mes, ano=ano).first()
+
+        orcamento = OrcamentoCategoria.query.filter_by(
+            categoria_id=categoria_id, mes=mes, ano=ano, user_id=str(g.user_id)
+        ).first()
         if not orcamento:
-            orcamento = OrcamentoCategoria(categoria_id=categoria_id, mes=mes, ano=ano)
+            orcamento = OrcamentoCategoria(
+                categoria_id=categoria_id, mes=mes, ano=ano, user_id=str(g.user_id)
+            )
             db.session.add(orcamento)
         orcamento.limite = limite
         db.session.commit()
@@ -662,9 +852,10 @@ def api_recorrencias():
                                         COALESCE(c.icone, '💰') AS categoria_icone,
                                         r.frequencia, r.proxima_data, r.ativa
                                  FROM recorrencias r LEFT JOIN categorias c ON c.id = r.categoria_id
-                                 ORDER BY r.ativa DESC, r.proxima_data""")
+                                 WHERE r.user_id = $1
+                                 ORDER BY r.ativa DESC, r.proxima_data""", g.user_id)
             return jsonify([_neon_recorrencia_dict(row) for row in rows])
-        return jsonify([item.to_dict() for item in Recorrencia.query.order_by(Recorrencia.ativa.desc(), Recorrencia.proxima_data).all()])
+        return jsonify([item.to_dict() for item in Recorrencia.query.filter_by(user_id=str(g.user_id)).order_by(Recorrencia.ativa.desc(), Recorrencia.proxima_data).all()])
     try:
         dados = _json_body()
         descricao, tipo, frequencia = str(dados.get("descricao", "")).strip(), dados.get("tipo"), dados.get("frequencia")
@@ -674,9 +865,16 @@ def api_recorrencias():
         categoria_id = _categoria_valida(dados.get("categoria_id"), tipo)
         proxima_data = _data_iso(dados.get("proxima_data"), "próxima data")
         if store:
-            row = store.fetchrow("INSERT INTO recorrencias (descricao, valor, tipo, categoria_id, frequencia, proxima_data, ativa) VALUES ($1, $2, $3, $4, $5, $6, TRUE) RETURNING id", descricao, valor, tipo, categoria_id, frequencia, proxima_data)
+            row = store.fetchrow(
+                "INSERT INTO recorrencias (descricao, valor, tipo, categoria_id, frequencia, proxima_data, ativa, user_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) RETURNING id",
+                descricao, valor, tipo, categoria_id, frequencia, proxima_data, g.user_id,
+            )
             return jsonify(_neon_get_recorrencia(row["id"])), 201
-        recorrencia = Recorrencia(descricao=descricao, valor=valor, tipo=tipo, categoria_id=categoria_id, frequencia=frequencia, proxima_data=proxima_data)
+        recorrencia = Recorrencia(
+            descricao=descricao, valor=valor, tipo=tipo, categoria_id=categoria_id,
+            frequencia=frequencia, proxima_data=proxima_data, user_id=str(g.user_id),
+        )
         db.session.add(recorrencia)
         db.session.commit()
         return jsonify(recorrencia.to_dict()), 201
@@ -690,16 +888,28 @@ def api_executar_recorrencia(rid):
     store = _neon_store()
     if store:
         async def executar(connection):
-            recorrencia = await connection.fetchrow("SELECT id, descricao, valor, tipo, categoria_id, frequencia, proxima_data, ativa FROM recorrencias WHERE id = $1 FOR UPDATE", rid)
+            recorrencia = await connection.fetchrow(
+                "SELECT id, descricao, valor, tipo, categoria_id, frequencia, proxima_data, ativa "
+                "FROM recorrencias WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                rid, g.user_id,
+            )
             if not recorrencia:
                 raise LookupError("Recorrência não encontrada.")
             if not recorrencia["ativa"]:
                 raise ValueError("Esta recorrência está pausada.")
             if recorrencia["proxima_data"] > date.today():
                 raise ValueError("Esta recorrência ainda não está vencida.")
-            transacao = await connection.fetchrow("INSERT INTO transacoes (descricao, valor, data, tipo, categoria_id) VALUES ($1, $2, $3, $4, $5) RETURNING id", recorrencia["descricao"], recorrencia["valor"], recorrencia["proxima_data"], recorrencia["tipo"], recorrencia["categoria_id"])
+            transacao = await connection.fetchrow(
+                "INSERT INTO transacoes (descricao, valor, data, tipo, categoria_id, user_id) "
+                "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                recorrencia["descricao"], recorrencia["valor"], recorrencia["proxima_data"],
+                recorrencia["tipo"], recorrencia["categoria_id"], g.user_id,
+            )
             proxima_data = recorrencia["proxima_data"] + FREQUENCIAS[recorrencia["frequencia"]]
-            await connection.execute("UPDATE recorrencias SET proxima_data = $1 WHERE id = $2", proxima_data, rid)
+            await connection.execute(
+                "UPDATE recorrencias SET proxima_data = $1 WHERE id = $2 AND user_id = $3",
+                proxima_data, rid, g.user_id,
+            )
             return transacao["id"]
 
         try:
@@ -709,14 +919,17 @@ def api_executar_recorrencia(rid):
         except ValueError as error:
             return _erro(str(error))
         return jsonify({"transacao": _neon_get_transacao(transacao_id), "recorrencia": _neon_get_recorrencia(rid)}), 201
-    recorrencia = db.session.get(Recorrencia, rid)
+    recorrencia = _sqlite_recorrencia(rid)
     if not recorrencia:
         return _erro("Recorrência não encontrada.", 404)
     if not recorrencia.ativa:
         return _erro("Esta recorrência está pausada.")
     if recorrencia.proxima_data > date.today():
         return _erro("Esta recorrência ainda não está vencida.")
-    transacao = Transacao(descricao=recorrencia.descricao, valor=recorrencia.valor, data=recorrencia.proxima_data, tipo=recorrencia.tipo, categoria_id=recorrencia.categoria_id)
+    transacao = Transacao(
+        descricao=recorrencia.descricao, valor=recorrencia.valor, data=recorrencia.proxima_data,
+        tipo=recorrencia.tipo, categoria_id=recorrencia.categoria_id, user_id=str(g.user_id),
+    )
     recorrencia.proxima_data = recorrencia.proxima_data + FREQUENCIAS[recorrencia.frequencia]
     db.session.add(transacao)
     db.session.commit()
@@ -725,12 +938,12 @@ def api_executar_recorrencia(rid):
 @app.route("/api/recorrencias/<int:rid>", methods=["PATCH", "DELETE"])
 def api_alterar_recorrencia(rid):
     store = _neon_store()
-    recorrencia = _neon_get_recorrencia(rid) if store else db.session.get(Recorrencia, rid)
+    recorrencia = _neon_get_recorrencia(rid) if store else _sqlite_recorrencia(rid)
     if not recorrencia:
         return _erro("Recorrência não encontrada.", 404)
     if request.method == "DELETE":
         if store:
-            store.execute("DELETE FROM recorrencias WHERE id = $1", rid)
+            store.execute("DELETE FROM recorrencias WHERE id = $1 AND user_id = $2", rid, g.user_id)
         else:
             db.session.delete(recorrencia)
             db.session.commit()
@@ -741,7 +954,10 @@ def api_alterar_recorrencia(rid):
         if not isinstance(ativa, bool):
             raise ValueError("O estado da recorrência deve ser verdadeiro ou falso.")
         if store:
-            store.execute("UPDATE recorrencias SET ativa = $1 WHERE id = $2", ativa, rid)
+            store.execute(
+                "UPDATE recorrencias SET ativa = $1 WHERE id = $2 AND user_id = $3",
+                ativa, rid, g.user_id,
+            )
             return jsonify(_neon_get_recorrencia(rid))
         recorrencia.ativa = ativa
         db.session.commit()
@@ -764,10 +980,11 @@ def api_relatorio_categorias():
     if store:
         rows = store.fetch("""SELECT c.nome, c.icone, c.cor, SUM(t.valor)::float8 AS total
                                FROM categorias c JOIN transacoes t ON t.categoria_id = c.id
-                               WHERE EXTRACT(MONTH FROM t.data) = $1 AND EXTRACT(YEAR FROM t.data) = $2 AND t.tipo = $3
-                               GROUP BY c.id, c.nome, c.icone, c.cor ORDER BY SUM(t.valor) DESC""", mes, ano, tipo)
+                               WHERE EXTRACT(MONTH FROM t.data) = $1 AND EXTRACT(YEAR FROM t.data) = $2
+                                 AND t.tipo = $3 AND t.user_id = $4
+                               GROUP BY c.id, c.nome, c.icone, c.cor ORDER BY SUM(t.valor) DESC""", mes, ano, tipo, g.user_id)
         return jsonify([{"nome": row["nome"], "icone": row["icone"], "cor": row["cor"], "total": round(float(row["total"]), 2)} for row in rows])
-    rows = db.session.query(Categoria.nome, Categoria.icone, Categoria.cor, func.sum(Transacao.valor).label("total")).join(Transacao, Transacao.categoria_id == Categoria.id).filter(extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano, Transacao.tipo == tipo).group_by(Categoria.id).order_by(func.sum(Transacao.valor).desc()).all()
+    rows = db.session.query(Categoria.nome, Categoria.icone, Categoria.cor, func.sum(Transacao.valor).label("total")).join(Transacao, Transacao.categoria_id == Categoria.id).filter(Transacao.user_id == str(g.user_id), extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano, Transacao.tipo == tipo).group_by(Categoria.id).order_by(func.sum(Transacao.valor).desc()).all()
     return jsonify([{"nome": row.nome, "icone": row.icone, "cor": row.cor, "total": round(row.total, 2)} for row in rows])
 
 @app.route("/api/relatorio/comparativo")

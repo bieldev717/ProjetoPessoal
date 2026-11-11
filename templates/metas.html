@@ -209,6 +209,6 @@ async function salvarOrcamento(event){
 }
 document.getElementById('sel-mes').addEventListener('change',()=>{carregarMeta();carregarOrcamentos();});
 document.getElementById('sel-ano').addEventListener('change',()=>{carregarMeta();carregarOrcamentos();});
-carregarMeta();carregarOrcamentos();
+runWhenAuthenticated(() => { carregarMeta(); carregarOrcamentos(); });
 </script>
 {% endblock %}

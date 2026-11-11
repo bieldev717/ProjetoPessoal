@@ -6,14 +6,21 @@ from datetime import date
 
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
-from app import _seed_categorias, app, db
+TEST_USER_ID = "11111111-1111-4111-8111-111111111111"
+OTHER_USER_ID = "22222222-2222-4222-8222-222222222222"
+
+from app import _neon_auth_base_url, _neon_auth_origin, _neon_jwks_url, _seed_categorias, app, db
 from models import Categoria, Transacao
 
 
 class FinanceApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        app.config.update(TESTING=True)
+        app.config.update(
+            TESTING=True,
+            AUTH_TESTING=True,
+            AUTH_TEST_USER_ID=TEST_USER_ID,
+        )
         cls.client = app.test_client()
 
     def setUp(self):
@@ -60,9 +67,9 @@ class FinanceApiTests(unittest.TestCase):
         with app.app_context():
             categoria_id = self.despesa.id
             db.session.add_all([
-                Transacao(descricao="Mercado Central", valor=40, data=date(2026, 5, 2), tipo="saida", categoria_id=categoria_id),
-                Transacao(descricao="Mercado Bairro", valor=15, data=date(2026, 5, 3), tipo="saida", categoria_id=categoria_id),
-                Transacao(descricao="Conta de luz", valor=80, data=date(2026, 5, 4), tipo="saida", categoria_id=categoria_id),
+                Transacao(descricao="Mercado Central", valor=40, data=date(2026, 5, 2), tipo="saida", categoria_id=categoria_id, user_id=TEST_USER_ID),
+                Transacao(descricao="Mercado Bairro", valor=15, data=date(2026, 5, 3), tipo="saida", categoria_id=categoria_id, user_id=TEST_USER_ID),
+                Transacao(descricao="Conta de luz", valor=80, data=date(2026, 5, 4), tipo="saida", categoria_id=categoria_id, user_id=TEST_USER_ID),
             ])
             db.session.commit()
         response = self.client.get("/api/transacoes?mes=5&ano=2026&q=mercado&per_page=1&page=1")
@@ -75,7 +82,7 @@ class FinanceApiTests(unittest.TestCase):
 
     def test_csv_filtra_e_protege_formula(self):
         with app.app_context():
-            db.session.add(Transacao(descricao="=1+1", valor=10, data=date(2026, 5, 2), tipo="saida", categoria_id=self.despesa.id))
+            db.session.add(Transacao(descricao="=1+1", valor=10, data=date(2026, 5, 2), tipo="saida", categoria_id=self.despesa.id, user_id=TEST_USER_ID))
             db.session.commit()
         response = self.client.get("/api/transacoes/exportar.csv?mes=5&ano=2026")
         self.assertEqual(response.status_code, 200)
@@ -88,7 +95,7 @@ class FinanceApiTests(unittest.TestCase):
         resposta = self.client.post("/api/orcamentos-categoria", json={"mes": 5, "ano": 2026, "categoria_id": categoria_id, "limite": 100})
         self.assertEqual(resposta.status_code, 200)
         with app.app_context():
-            db.session.add(Transacao(descricao="Compra", valor=125, data=date(2026, 5, 2), tipo="saida", categoria_id=categoria_id))
+            db.session.add(Transacao(descricao="Compra", valor=125, data=date(2026, 5, 2), tipo="saida", categoria_id=categoria_id, user_id=TEST_USER_ID))
             db.session.commit()
         dados = self.client.get("/api/orcamentos-categoria?mes=5&ano=2026").json
         self.assertEqual(dados[0]["gasto"], 125)
@@ -123,6 +130,62 @@ class FinanceApiTests(unittest.TestCase):
         self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
         self.assertEqual(response.headers["Referrer-Policy"], "strict-origin-when-cross-origin")
         self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+
+    def test_neon_auth_preserva_caminho_da_url_jwks(self):
+        with app.app_context():
+            auth_url_anterior = app.config["NEON_AUTH_URL"]
+            app.config["NEON_AUTH_URL"] = "https://auth.example.com/neondb/auth/"
+            try:
+                self.assertEqual(_neon_auth_base_url(), "https://auth.example.com/neondb/auth")
+                self.assertEqual(_neon_auth_origin(), "https://auth.example.com")
+                self.assertEqual(_neon_jwks_url(), "https://auth.example.com/neondb/auth/.well-known/jwks.json")
+            finally:
+                app.config["NEON_AUTH_URL"] = auth_url_anterior
+
+    def test_api_exige_autenticacao(self):
+        response = self.client.get("/api/auth/me", headers={"X-Test-User-ID": ""})
+        self.assertEqual(response.status_code, 401)
+
+    def test_dados_ficam_isolados_por_usuario(self):
+        with app.app_context():
+            categoria_id = self.despesa.id
+        outra_conta = {"X-Test-User-ID": OTHER_USER_ID}
+
+        criada = self.client.post(
+            "/api/transacoes",
+            json={"descricao": "Conta A", "valor": 42, "data": "2026-06-05", "tipo": "saida", "categoria_id": categoria_id},
+        )
+        transacao_id = criada.json["id"]
+        self.assertEqual(self.client.get("/api/transacoes?mes=6&ano=2026", headers=outra_conta).json["total"], 0)
+        self.assertEqual(self.client.get(f"/api/transacoes/{transacao_id}", headers=outra_conta).status_code, 404)
+        self.assertEqual(self.client.put(f"/api/transacoes/{transacao_id}", headers=outra_conta, json={}).status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/transacoes/{transacao_id}", headers=outra_conta).status_code, 404)
+
+        self.client.post("/api/metas", json={"mes": 6, "ano": 2026, "limite_gastos": 800, "meta_receita": 3000})
+        meta_outra_conta = self.client.get("/api/metas?mes=6&ano=2026", headers=outra_conta).json
+        self.assertEqual(meta_outra_conta["limite_gastos"], 0)
+
+        self.client.post("/api/orcamentos-categoria", json={"mes": 6, "ano": 2026, "categoria_id": categoria_id, "limite": 250})
+        self.assertEqual(self.client.get("/api/orcamentos-categoria?mes=6&ano=2026", headers=outra_conta).json, [])
+
+        recorrencia = self.client.post(
+            "/api/recorrencias",
+            json={"descricao": "Conta A", "valor": 50, "tipo": "saida", "frequencia": "mensal", "proxima_data": "2026-06-05", "categoria_id": categoria_id},
+        )
+        recorrencia_id = recorrencia.json["id"]
+        self.assertEqual(self.client.get("/api/recorrencias", headers=outra_conta).json, [])
+        self.assertEqual(self.client.post(f"/api/recorrencias/{recorrencia_id}/executar", headers=outra_conta).status_code, 404)
+
+    def test_paginas_de_acesso_e_painel_estao_disponiveis(self):
+        for path in ("/login", "/cadastro"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b'data-auth-page="true"', response.data)
+        for path in ("/", "/transacoes", "/extrato", "/metas", "/recorrencias"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, path)
+            self.assertIn(b'data-auth-required="true"', response.data)
+            self.assertIn(b"runWhenAuthenticated", response.data)
 
 
 if __name__ == "__main__":

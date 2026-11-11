@@ -36,6 +36,6 @@ function renderTabela(dados,page) {
 async function exportarCSV(){try{const response=await fetch(`/api/transacoes/exportar.csv?${filtros()}`);if(!response.ok){const erro=await response.json();throw new Error(erro.erro||'Falha na exportação.');}const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download='extrato-financeiro.csv';link.click();URL.revokeObjectURL(url);}catch(error){showToast(error.message,'error');}}
 ['f-mes','f-ano','f-tipo','f-cat'].forEach(id=>document.getElementById(id).addEventListener('change',()=>aplicarFiltros(1)));
 document.getElementById('f-busca').addEventListener('input',debounce(()=>aplicarFiltros(1),250));
-aplicarFiltros();
+runWhenAuthenticated(() => aplicarFiltros());
 </script>
 {% endblock %}
