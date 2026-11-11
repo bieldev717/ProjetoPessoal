@@ -6,10 +6,13 @@ import math
 import os
 import secrets
 from datetime import date, datetime
+from types import SimpleNamespace
 
 from dateutil.relativedelta import relativedelta
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, current_app, jsonify, render_template, request
 from sqlalchemy import and_, extract, func
+
+from neon_store import NeonStore
 from werkzeug.exceptions import HTTPException
 
 from extensions import db
@@ -69,18 +72,119 @@ def _argumento_inteiro(chave, padrao=None):
         raise ValueError(f"O parâmetro {chave} deve ser um número inteiro.")
 
 
+def _neon_store():
+    return current_app.extensions.get("neon_store")
+
+
+def _categorias(tipo=None):
+    store = _neon_store()
+    if store:
+        if tipo:
+            rows = store.fetch("SELECT id, nome, tipo, icone, cor FROM categorias WHERE tipo = $1 ORDER BY tipo, nome", tipo)
+        else:
+            rows = store.fetch("SELECT id, nome, tipo, icone, cor FROM categorias ORDER BY tipo, nome")
+        return [SimpleNamespace(**dict(row)) for row in rows]
+    query = Categoria.query.order_by(Categoria.tipo, Categoria.nome)
+    if tipo:
+        query = query.filter_by(tipo=tipo)
+    return query.all()
+
+
 def _categoria_valida(categoria_id, tipo=None):
     if categoria_id in (None, ""):
         return None
     try:
-        categoria = db.session.get(Categoria, int(categoria_id))
+        categoria_id = int(categoria_id)
     except (TypeError, ValueError):
-        categoria = None
+        raise ValueError("Categoria não encontrada.")
+    store = _neon_store()
+    if store:
+        categoria = store.fetchrow("SELECT id, tipo FROM categorias WHERE id = $1", categoria_id)
+    else:
+        categoria = db.session.get(Categoria, categoria_id)
     if not categoria:
         raise ValueError("Categoria não encontrada.")
-    if tipo and categoria.tipo != tipo:
+    categoria_tipo = categoria["tipo"] if store else categoria.tipo
+    if tipo and categoria_tipo != tipo:
         raise ValueError("A categoria não corresponde ao tipo da transação.")
-    return categoria.id
+    return categoria_id
+
+
+def _neon_transacao_select():
+    return """SELECT t.id, t.descricao, t.valor, t.data, t.tipo, t.categoria_id,
+                     COALESCE(c.nome, '—') AS categoria_nome,
+                     COALESCE(c.icone, '💰') AS categoria_icone,
+                     COALESCE(c.cor, '#6ee7b7') AS categoria_cor
+              FROM transacoes t LEFT JOIN categorias c ON c.id = t.categoria_id"""
+
+
+def _neon_transacao_dict(row):
+    return {
+        "id": row["id"], "descricao": row["descricao"], "valor": float(row["valor"]),
+        "data": row["data"].isoformat(), "tipo": row["tipo"], "categoria_id": row["categoria_id"],
+        "categoria_nome": row["categoria_nome"], "categoria_icone": row["categoria_icone"],
+        "categoria_cor": row["categoria_cor"],
+    }
+
+
+def _neon_get_transacao(transacao_id):
+    row = _neon_store().fetchrow(f"{_neon_transacao_select()} WHERE t.id = $1", transacao_id)
+    return _neon_transacao_dict(row) if row else None
+
+
+def _neon_recorrencia_dict(row):
+    if not row:
+        return None
+    item = dict(row)
+    item["valor"] = float(item["valor"])
+    item["proxima_data"] = item["proxima_data"].isoformat()
+    return item
+
+
+def _neon_get_recorrencia(recorrencia_id):
+    row = _neon_store().fetchrow("""SELECT r.id, r.descricao, r.valor, r.tipo, r.categoria_id,
+                                         COALESCE(c.nome, '—') AS categoria_nome,
+                                         COALESCE(c.icone, '💰') AS categoria_icone,
+                                         r.frequencia, r.proxima_data, r.ativa
+                                  FROM recorrencias r LEFT JOIN categorias c ON c.id = r.categoria_id
+                                  WHERE r.id = $1""", recorrencia_id)
+    return _neon_recorrencia_dict(row)
+
+
+def _neon_transacao_filtros():
+    conditions, values = [], []
+
+    def add(expression, value):
+        values.append(value)
+        conditions.append(expression.format(index=len(values)))
+
+    mes, ano = _argumento_inteiro("mes"), _argumento_inteiro("ano")
+    tipo, categoria_id = request.args.get("tipo", "").strip(), _argumento_inteiro("categoria_id")
+    busca = request.args.get("q", "").strip()[:100]
+    inicio, fim = request.args.get("data_inicio"), request.args.get("data_fim")
+    if mes is not None and not 1 <= mes <= 12:
+        raise ValueError("Mês inválido.")
+    if ano is not None and not 1900 <= ano <= 2200:
+        raise ValueError("Ano inválido.")
+    if tipo and tipo not in TIPOS:
+        raise ValueError("Tipo de transação inválido.")
+    if categoria_id is not None:
+        add("t.categoria_id = ${index}", _categoria_valida(categoria_id))
+    if mes is not None:
+        add("EXTRACT(MONTH FROM t.data) = ${index}", mes)
+    if ano is not None:
+        add("EXTRACT(YEAR FROM t.data) = ${index}", ano)
+    if tipo:
+        add("t.tipo = ${index}", tipo)
+    if busca:
+        add("t.descricao ILIKE ${index}", f"%{busca}%")
+    if inicio:
+        add("t.data >= ${index}", _data_iso(inicio, "data inicial"))
+    if fim:
+        add("t.data <= ${index}", _data_iso(fim, "data final"))
+    if inicio and fim and _data_iso(inicio, "data inicial") > _data_iso(fim, "data final"):
+        raise ValueError("A data inicial deve ser anterior à data final.")
+    return (" WHERE " + " AND ".join(conditions) if conditions else ""), values
 
 
 def create_app(test_config=None):
@@ -93,14 +197,24 @@ def create_app(test_config=None):
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
         SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
         JSON_SORT_KEYS=False,
+        USE_NEON=False,
     )
     if test_config:
         app.config.update(test_config)
-    db.init_app(app)
-
-    with app.app_context():
-        db.create_all()
-        _seed_categorias()
+    database_path = app.config["SQLALCHEMY_DATABASE_URI"]
+    is_neon = database_path.startswith(("postgresql://", "postgresql+asyncpg://"))
+    if os.environ.get("VERCEL") and not is_neon:
+        raise RuntimeError("DATABASE_URL do Neon é obrigatória na Vercel; SQLite não aceita gravações persistentes.")
+    app.config["USE_NEON"] = is_neon
+    if is_neon:
+        app.extensions["neon_store"] = NeonStore(database_path)
+        with app.app_context():
+            _seed_neon_categorias()
+    else:
+        db.init_app(app)
+        with app.app_context():
+            db.create_all()
+            _seed_categorias()
 
     @app.after_request
     def security_headers(response):
@@ -128,10 +242,8 @@ def create_app(test_config=None):
     return app
 
 
-def _seed_categorias():
-    if Categoria.query.count():
-        return
-    defaults = [
+def _categorias_padrao():
+    return [
         {"nome": "Salário", "tipo": "entrada", "icone": "💼", "cor": "#6ee7b7"},
         {"nome": "Freelance", "tipo": "entrada", "icone": "💻", "cor": "#34d399"},
         {"nome": "Investimentos", "tipo": "entrada", "icone": "📈", "cor": "#10b981"},
@@ -145,22 +257,51 @@ def _seed_categorias():
         {"nome": "Roupas", "tipo": "saida", "icone": "👗", "cor": "#f472b6"},
         {"nome": "Outros (saída)", "tipo": "saida", "icone": "➖", "cor": "#94a3b8"},
     ]
-    db.session.add_all(Categoria(**item) for item in defaults)
-    db.session.commit()
+
+
+def _seed_categorias():
+    if not Categoria.query.count():
+        db.session.add_all(Categoria(**item) for item in _categorias_padrao())
+        db.session.commit()
+
+
+def _seed_neon_categorias():
+    store = _neon_store()
+
+    async def inserir_padrao(connection):
+        for item in _categorias_padrao():
+            await connection.execute(
+                "INSERT INTO categorias (nome, tipo, icone, cor) VALUES ($1, $2, $3, $4) ON CONFLICT (nome) DO NOTHING",
+                item["nome"], item["tipo"], item["icone"], item["cor"],
+            )
+
+    store.transaction(inserir_padrao)
 
 
 def _resumo_mes(mes, ano):
     totais = {"entrada": 0.0, "saida": 0.0}
-    resultados = (
-        db.session.query(Transacao.tipo, func.sum(Transacao.valor))
-        .filter(extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano)
-        .group_by(Transacao.tipo).all()
-    )
-    for tipo, total in resultados:
-        totais[tipo] = round(total or 0, 2)
-    meta = Meta.query.filter_by(mes=mes, ano=ano).first()
-    limite = meta.limite_gastos if meta else 0.0
-    meta_receita = meta.meta_receita if meta else 0.0
+    store = _neon_store()
+    if store:
+        resultados = store.fetch(
+            "SELECT tipo, COALESCE(SUM(valor), 0)::float8 AS total FROM transacoes WHERE EXTRACT(MONTH FROM data) = $1 AND EXTRACT(YEAR FROM data) = $2 GROUP BY tipo",
+            mes, ano,
+        )
+        meta = store.fetchrow("SELECT limite_gastos, meta_receita FROM metas WHERE mes = $1 AND ano = $2", mes, ano)
+        for row in resultados:
+            totais[row["tipo"]] = round(float(row["total"] or 0), 2)
+        limite = float(meta["limite_gastos"]) if meta else 0.0
+        meta_receita = float(meta["meta_receita"]) if meta else 0.0
+    else:
+        resultados = (
+            db.session.query(Transacao.tipo, func.sum(Transacao.valor))
+            .filter(extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano)
+            .group_by(Transacao.tipo).all()
+        )
+        for tipo, total in resultados:
+            totais[tipo] = round(total or 0, 2)
+        meta = Meta.query.filter_by(mes=mes, ano=ano).first()
+        limite = meta.limite_gastos if meta else 0.0
+        meta_receita = meta.meta_receita if meta else 0.0
     despesas, receitas = totais["saida"], totais["entrada"]
     progresso_gastos = round(despesas / limite * 100, 1) if limite else 0
     progresso_receita = round(receitas / meta_receita * 100, 1) if meta_receita else 0
@@ -178,30 +319,30 @@ app = create_app()
 @app.route("/")
 def dashboard():
     hoje = date.today()
-    return render_template("dashboard.html", resumo=_resumo_mes(hoje.month, hoje.year), categorias=Categoria.query.order_by(Categoria.tipo, Categoria.nome).all(), mes_atual=hoje.month, ano_atual=hoje.year)
+    return render_template("dashboard.html", resumo=_resumo_mes(hoje.month, hoje.year), categorias=_categorias(), mes_atual=hoje.month, ano_atual=hoje.year)
 
 
 @app.route("/transacoes")
 def transacoes_page():
     hoje = date.today()
-    return render_template("transacoes.html", categorias=Categoria.query.order_by(Categoria.tipo, Categoria.nome).all(), mes_atual=hoje.month, ano_atual=hoje.year)
+    return render_template("transacoes.html", categorias=_categorias(), mes_atual=hoje.month, ano_atual=hoje.year)
 
 
 @app.route("/extrato")
 def extrato_page():
     hoje = date.today()
-    return render_template("extrato.html", categorias=Categoria.query.order_by(Categoria.nome).all(), mes_atual=hoje.month, ano_atual=hoje.year)
+    return render_template("extrato.html", categorias=_categorias(), mes_atual=hoje.month, ano_atual=hoje.year)
 
 
 @app.route("/metas")
 def metas_page():
     hoje = date.today()
-    return render_template("metas.html", mes_atual=hoje.month, ano_atual=hoje.year, categorias=Categoria.query.filter_by(tipo="saida").order_by(Categoria.nome).all())
+    return render_template("metas.html", mes_atual=hoje.month, ano_atual=hoje.year, categorias=_categorias("saida"))
 
 
 @app.route("/recorrencias")
 def recorrencias_page():
-    return render_template("recorrencias.html", categorias=Categoria.query.order_by(Categoria.tipo, Categoria.nome).all())
+    return render_template("recorrencias.html", categorias=_categorias())
 
 
 @app.route("/api/dashboard/resumo")
@@ -255,44 +396,69 @@ def _query_transacoes():
 @app.route("/api/transacoes", methods=["GET"])
 def api_listar_transacoes():
     try:
-        query = _query_transacoes()
         page = max(1, request.args.get("page", 1, type=int) or 1)
         per_page = min(100, max(1, request.args.get("per_page", 20, type=int) or 20))
+        store = _neon_store()
+        if store:
+            where, values = _neon_transacao_filtros()
+            total_row = store.fetchrow(f"SELECT COUNT(*) AS total FROM transacoes t{where}", *values)
+            limit_index, offset_index = len(values) + 1, len(values) + 2
+            rows = store.fetch(
+                f"{_neon_transacao_select()}{where} ORDER BY t.data DESC, t.criado_em DESC LIMIT ${limit_index} OFFSET ${offset_index}",
+                *values, per_page, (page - 1) * per_page,
+            )
+            total = total_row["total"]
+            items = [_neon_transacao_dict(row) for row in rows]
+        else:
+            query = _query_transacoes()
+            total = query.count()
+            items = [item.to_dict() for item in query.offset((page - 1) * per_page).limit(per_page).all()]
     except ValueError as error:
         return _erro(str(error))
-    total = query.count()
-    items = query.offset((page - 1) * per_page).limit(per_page).all()
-    return jsonify({"total": total, "page": page, "per_page": per_page, "pages": (total + per_page - 1) // per_page, "items": [item.to_dict() for item in items]})
-
+    return jsonify({"total": total, "page": page, "per_page": per_page, "pages": (total + per_page - 1) // per_page, "items": items})
 
 @app.route("/api/transacoes/resumo")
 def api_resumo_transacoes():
     try:
-        query = _query_transacoes().order_by(None).with_entities(Transacao.tipo, func.sum(Transacao.valor)).group_by(Transacao.tipo)
         totais = {"entrada": 0.0, "saida": 0.0}
-        for tipo, total in query.all():
-            totais[tipo] = round(total or 0, 2)
+        store = _neon_store()
+        if store:
+            where, values = _neon_transacao_filtros()
+            rows = store.fetch(f"SELECT t.tipo, COALESCE(SUM(t.valor), 0)::float8 AS total FROM transacoes t{where} GROUP BY t.tipo", *values)
+            for row in rows:
+                totais[row["tipo"]] = round(float(row["total"] or 0), 2)
+        else:
+            query = _query_transacoes().order_by(None).with_entities(Transacao.tipo, func.sum(Transacao.valor)).group_by(Transacao.tipo)
+            for tipo, total in query.all():
+                totais[tipo] = round(total or 0, 2)
         return jsonify({"receitas": totais["entrada"], "despesas": totais["saida"], "saldo": round(totais["entrada"] - totais["saida"], 2)})
     except ValueError as error:
         return _erro(str(error))
 
-
 @app.route("/api/transacoes/exportar.csv")
 def api_exportar_transacoes():
     try:
-        items = _query_transacoes().all()
+        store = _neon_store()
+        if store:
+            where, values = _neon_transacao_filtros()
+            items = store.fetch(f"{_neon_transacao_select()}{where} ORDER BY t.data DESC, t.criado_em DESC", *values)
+        else:
+            items = _query_transacoes().all()
     except ValueError as error:
         return _erro(str(error))
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     writer.writerow(["Data", "Descrição", "Tipo", "Categoria", "Valor"])
     for item in items:
-        writer.writerow([item.data.isoformat(), _csv_safe(item.descricao), item.tipo, _csv_safe(item.categoria.nome if item.categoria else ""), f"{item.valor:.2f}"])
+        if store:
+            writer.writerow([item["data"].isoformat(), _csv_safe(item["descricao"]), item["tipo"], _csv_safe(item["categoria_nome"]), f"{float(item['valor']):.2f}"])
+        else:
+            writer.writerow([item.data.isoformat(), _csv_safe(item.descricao), item.tipo, _csv_safe(item.categoria.nome if item.categoria else ""), f"{item.valor:.2f}"])
     return Response("\ufeff" + output.getvalue(), mimetype="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=extrato-financeiro.csv"})
-
 
 @app.route("/api/transacoes", methods=["POST"])
 def api_criar_transacao():
+    store = _neon_store()
     try:
         dados = _json_body()
         descricao = str(dados.get("descricao", "")).strip()
@@ -301,82 +467,104 @@ def api_criar_transacao():
             raise ValueError("A descrição deve conter entre 1 e 200 caracteres.")
         if tipo not in TIPOS:
             raise ValueError("Tipo de transação inválido.")
-        transacao = Transacao(descricao=descricao, valor=_valor_positivo(dados.get("valor")), data=_data_iso(dados.get("data")), tipo=tipo, categoria_id=_categoria_valida(dados.get("categoria_id"), tipo))
+        valor = _valor_positivo(dados.get("valor"))
+        data_transacao = _data_iso(dados.get("data"))
+        categoria_id = _categoria_valida(dados.get("categoria_id"), tipo)
+        if store:
+            row = store.fetchrow("INSERT INTO transacoes (descricao, valor, data, tipo, categoria_id) VALUES ($1, $2, $3, $4, $5) RETURNING id", descricao, valor, data_transacao, tipo, categoria_id)
+            return jsonify(_neon_get_transacao(row["id"])), 201
+        transacao = Transacao(descricao=descricao, valor=valor, data=data_transacao, tipo=tipo, categoria_id=categoria_id)
         db.session.add(transacao)
         db.session.commit()
         return jsonify(transacao.to_dict()), 201
     except ValueError as error:
-        db.session.rollback()
+        if not store:
+            db.session.rollback()
         return _erro(str(error))
-
 
 @app.route("/api/transacoes/<int:tid>", methods=["GET"])
 def api_obter_transacao(tid):
-    item = db.session.get(Transacao, tid)
-    return jsonify(item.to_dict()) if item else _erro("Transação não encontrada.", 404)
-
+    store = _neon_store()
+    item = _neon_get_transacao(tid) if store else db.session.get(Transacao, tid)
+    if not item:
+        return _erro("Transação não encontrada.", 404)
+    return jsonify(item if store else item.to_dict())
 
 @app.route("/api/transacoes/<int:tid>", methods=["PUT"])
 def api_atualizar_transacao(tid):
-    item = db.session.get(Transacao, tid)
+    store = _neon_store()
+    item = _neon_get_transacao(tid) if store else db.session.get(Transacao, tid)
     if not item:
         return _erro("Transação não encontrada.", 404)
     try:
         dados = _json_body()
-        descricao = str(dados.get("descricao", item.descricao)).strip()
-        tipo = dados.get("tipo", item.tipo)
+        descricao = str(dados.get("descricao", item["descricao"] if store else item.descricao)).strip()
+        tipo = dados.get("tipo", item["tipo"] if store else item.tipo)
         if not descricao or len(descricao) > 200:
             raise ValueError("A descrição deve conter entre 1 e 200 caracteres.")
         if tipo not in TIPOS:
             raise ValueError("Tipo de transação inválido.")
-        item.descricao = descricao
-        item.tipo = tipo
-        item.valor = _valor_positivo(dados.get("valor", item.valor))
-        item.data = _data_iso(dados["data"]) if "data" in dados else item.data
-        item.categoria_id = _categoria_valida(dados.get("categoria_id", item.categoria_id), tipo)
+        valor = _valor_positivo(dados.get("valor", item["valor"] if store else item.valor))
+        data_transacao = _data_iso(dados["data"]) if "data" in dados else (date.fromisoformat(item["data"]) if store else item.data)
+        categoria_id = _categoria_valida(dados.get("categoria_id", item["categoria_id"] if store else item.categoria_id), tipo)
+        if store:
+            store.execute("UPDATE transacoes SET descricao = $1, tipo = $2, valor = $3, data = $4, categoria_id = $5 WHERE id = $6", descricao, tipo, valor, data_transacao, categoria_id, tid)
+            return jsonify(_neon_get_transacao(tid))
+        item.descricao, item.tipo, item.valor, item.data, item.categoria_id = descricao, tipo, valor, data_transacao, categoria_id
         db.session.commit()
         return jsonify(item.to_dict())
     except ValueError as error:
-        db.session.rollback()
+        if not store:
+            db.session.rollback()
         return _erro(str(error))
-
 
 @app.route("/api/transacoes/<int:tid>", methods=["DELETE"])
 def api_deletar_transacao(tid):
-    item = db.session.get(Transacao, tid)
+    store = _neon_store()
+    item = _neon_get_transacao(tid) if store else db.session.get(Transacao, tid)
     if not item:
         return _erro("Transação não encontrada.", 404)
-    db.session.delete(item)
-    db.session.commit()
+    if store:
+        store.execute("DELETE FROM transacoes WHERE id = $1", tid)
+    else:
+        db.session.delete(item)
+        db.session.commit()
     return jsonify({"ok": True, "id": tid})
-
 
 @app.route("/api/categorias", methods=["GET"])
 def api_listar_categorias():
     tipo = request.args.get("tipo")
     if tipo and tipo not in TIPOS:
         return _erro("Tipo de categoria inválido.")
+    store = _neon_store()
+    if store:
+        rows = store.fetch("SELECT id, nome, tipo, icone, cor FROM categorias WHERE ($1::text IS NULL OR tipo = $1) ORDER BY tipo, nome", tipo or None)
+        return jsonify([dict(row) for row in rows])
     query = Categoria.query.order_by(Categoria.tipo, Categoria.nome)
     if tipo:
         query = query.filter_by(tipo=tipo)
     return jsonify([item.to_dict() for item in query.all()])
 
-
 @app.route("/api/categorias", methods=["POST"])
 def api_criar_categoria():
+    store = _neon_store()
     try:
         dados = _json_body()
         nome, tipo = str(dados.get("nome", "")).strip(), dados.get("tipo")
         if not nome or len(nome) > 80 or tipo not in TIPOS:
             raise ValueError("Informe um nome de até 80 caracteres e um tipo válido.")
-        categoria = Categoria(nome=nome, tipo=tipo, icone=str(dados.get("icone", "💰"))[:10], cor="#6ee7b7")
+        icone = str(dados.get("icone", "💰"))[:10]
+        if store:
+            row = store.fetchrow("INSERT INTO categorias (nome, tipo, icone, cor) VALUES ($1, $2, $3, $4) RETURNING id, nome, tipo, icone, cor", nome, tipo, icone, "#6ee7b7")
+            return jsonify(dict(row)), 201
+        categoria = Categoria(nome=nome, tipo=tipo, icone=icone, cor="#6ee7b7")
         db.session.add(categoria)
         db.session.commit()
         return jsonify(categoria.to_dict()), 201
     except ValueError as error:
-        db.session.rollback()
+        if not store:
+            db.session.rollback()
         return _erro(str(error))
-
 
 @app.route("/api/metas", methods=["GET"])
 def api_listar_metas():
@@ -384,8 +572,13 @@ def api_listar_metas():
         mes, ano = _validar_mes_ano(_argumento_inteiro("mes", date.today().month), _argumento_inteiro("ano", date.today().year))
     except ValueError as error:
         return _erro(str(error))
-    meta = Meta.query.filter_by(mes=mes, ano=ano).first()
-    resultado = meta.to_dict() if meta else {"mes": mes, "ano": ano, "limite_gastos": 0, "meta_receita": 0}
+    store = _neon_store()
+    if store:
+        meta = store.fetchrow("SELECT id, mes, ano, limite_gastos, meta_receita FROM metas WHERE mes = $1 AND ano = $2", mes, ano)
+        resultado = dict(meta) if meta else {"mes": mes, "ano": ano, "limite_gastos": 0, "meta_receita": 0}
+    else:
+        meta = Meta.query.filter_by(mes=mes, ano=ano).first()
+        resultado = meta.to_dict() if meta else {"mes": mes, "ano": ano, "limite_gastos": 0, "meta_receita": 0}
     resumo = _resumo_mes(mes, ano)
     resultado.update({"despesas_atuais": resumo["despesas"], "receitas_atuais": resumo["receitas"], "progresso_gastos": resumo["progresso_gastos"], "progresso_receita": resumo["progresso_receita"], "alerta_limite": resumo["alerta_limite"]})
     return jsonify(resultado)
@@ -393,21 +586,26 @@ def api_listar_metas():
 
 @app.route("/api/metas", methods=["POST"])
 def api_salvar_meta():
+    store = _neon_store()
     try:
         dados = _json_body()
         mes, ano = _validar_mes_ano(int(dados.get("mes", date.today().month)), int(dados.get("ano", date.today().year)))
+        limite = _valor_positivo(dados.get("limite_gastos", 0), "limite", True)
+        meta_receita = _valor_positivo(dados.get("meta_receita", 0), "meta de receita", True)
+        if store:
+            meta = store.fetchrow("INSERT INTO metas (mes, ano, limite_gastos, meta_receita) VALUES ($1, $2, $3, $4) ON CONFLICT (mes, ano) DO UPDATE SET limite_gastos = EXCLUDED.limite_gastos, meta_receita = EXCLUDED.meta_receita RETURNING id, mes, ano, limite_gastos, meta_receita", mes, ano, limite, meta_receita)
+            return jsonify(dict(meta))
         meta = Meta.query.filter_by(mes=mes, ano=ano).first()
         if not meta:
             meta = Meta(mes=mes, ano=ano)
             db.session.add(meta)
-        meta.limite_gastos = _valor_positivo(dados.get("limite_gastos", 0), "limite", True)
-        meta.meta_receita = _valor_positivo(dados.get("meta_receita", 0), "meta de receita", True)
+        meta.limite_gastos, meta.meta_receita = limite, meta_receita
         db.session.commit()
         return jsonify(meta.to_dict())
     except (ValueError, TypeError) as error:
-        db.session.rollback()
+        if not store:
+            db.session.rollback()
         return _erro(str(error))
-
 
 @app.route("/api/orcamentos-categoria", methods=["GET"])
 def api_orcamentos_categoria():
@@ -415,12 +613,23 @@ def api_orcamentos_categoria():
         mes, ano = _validar_mes_ano(_argumento_inteiro("mes", date.today().month), _argumento_inteiro("ano", date.today().year))
     except ValueError as error:
         return _erro(str(error))
+    store = _neon_store()
+    if store:
+        linhas = store.fetch("""SELECT o.id, o.categoria_id, c.nome AS categoria_nome, c.icone AS categoria_icone,
+                                      o.limite, COALESCE(SUM(t.valor), 0)::float8 AS gasto
+                               FROM orcamentos_categoria o
+                               JOIN categorias c ON c.id = o.categoria_id
+                               LEFT JOIN transacoes t ON t.categoria_id = o.categoria_id AND t.tipo = 'saida'
+                                 AND EXTRACT(MONTH FROM t.data) = $1 AND EXTRACT(YEAR FROM t.data) = $2
+                               WHERE o.mes = $1 AND o.ano = $2
+                               GROUP BY o.id, c.id, c.nome, c.icone, o.limite ORDER BY c.nome""", mes, ano)
+        return jsonify([{"id": row["id"], "categoria_id": row["categoria_id"], "categoria_nome": row["categoria_nome"], "categoria_icone": row["categoria_icone"], "limite": float(row["limite"]), "gasto": round(float(row["gasto"]), 2), "progresso": round(float(row["gasto"]) / float(row["limite"]) * 100, 1), "alerta": float(row["gasto"]) >= float(row["limite"]) * 0.8, "ultrapassado": float(row["gasto"]) > float(row["limite"])} for row in linhas])
     linhas = db.session.query(OrcamentoCategoria, func.coalesce(func.sum(Transacao.valor), 0)).select_from(OrcamentoCategoria).join(Categoria, Categoria.id == OrcamentoCategoria.categoria_id).outerjoin(Transacao, and_(Transacao.categoria_id == Categoria.id, Transacao.tipo == "saida", extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano)).filter(OrcamentoCategoria.mes == mes, OrcamentoCategoria.ano == ano).group_by(OrcamentoCategoria.id, Categoria.id, Categoria.nome, Categoria.icone).order_by(Categoria.nome).all()
     return jsonify([{"id": orc.id, "categoria_id": orc.categoria_id, "categoria_nome": orc.categoria.nome, "categoria_icone": orc.categoria.icone, "limite": orc.limite, "gasto": round(gasto, 2), "progresso": round(gasto / orc.limite * 100, 1) if orc.limite else 0, "alerta": gasto >= orc.limite * 0.8, "ultrapassado": gasto > orc.limite} for orc, gasto in linhas])
 
-
 @app.route("/api/orcamentos-categoria", methods=["POST"])
 def api_salvar_orcamento_categoria():
+    store = _neon_store()
     try:
         dados = _json_body()
         mes, ano = _validar_mes_ano(int(dados.get("mes", date.today().month)), int(dados.get("ano", date.today().year)))
@@ -428,38 +637,78 @@ def api_salvar_orcamento_categoria():
         if not categoria_id:
             raise ValueError("Selecione uma categoria de despesa.")
         limite = _valor_positivo(dados.get("limite"), "limite")
+        if store:
+            store.fetchrow("INSERT INTO orcamentos_categoria (categoria_id, mes, ano, limite) VALUES ($1, $2, $3, $4) ON CONFLICT (categoria_id, mes, ano) DO UPDATE SET limite = EXCLUDED.limite RETURNING id", categoria_id, mes, ano, limite)
+            return jsonify({"ok": True})
         orcamento = OrcamentoCategoria.query.filter_by(categoria_id=categoria_id, mes=mes, ano=ano).first()
         if not orcamento:
             orcamento = OrcamentoCategoria(categoria_id=categoria_id, mes=mes, ano=ano)
             db.session.add(orcamento)
         orcamento.limite = limite
         db.session.commit()
-        return jsonify({"ok": True}), 200
+        return jsonify({"ok": True})
     except (ValueError, TypeError) as error:
-        db.session.rollback()
+        if not store:
+            db.session.rollback()
         return _erro(str(error))
-
 
 @app.route("/api/recorrencias", methods=["GET", "POST"])
 def api_recorrencias():
+    store = _neon_store()
     if request.method == "GET":
+        if store:
+            rows = store.fetch("""SELECT r.id, r.descricao, r.valor, r.tipo, r.categoria_id,
+                                        COALESCE(c.nome, '—') AS categoria_nome,
+                                        COALESCE(c.icone, '💰') AS categoria_icone,
+                                        r.frequencia, r.proxima_data, r.ativa
+                                 FROM recorrencias r LEFT JOIN categorias c ON c.id = r.categoria_id
+                                 ORDER BY r.ativa DESC, r.proxima_data""")
+            return jsonify([_neon_recorrencia_dict(row) for row in rows])
         return jsonify([item.to_dict() for item in Recorrencia.query.order_by(Recorrencia.ativa.desc(), Recorrencia.proxima_data).all()])
     try:
         dados = _json_body()
         descricao, tipo, frequencia = str(dados.get("descricao", "")).strip(), dados.get("tipo"), dados.get("frequencia")
         if not descricao or len(descricao) > 200 or tipo not in TIPOS or frequencia not in FREQUENCIAS:
             raise ValueError("Informe descrição, tipo e frequência válidos.")
-        recorrencia = Recorrencia(descricao=descricao, valor=_valor_positivo(dados.get("valor")), tipo=tipo, categoria_id=_categoria_valida(dados.get("categoria_id"), tipo), frequencia=frequencia, proxima_data=_data_iso(dados.get("proxima_data"), "próxima data"))
+        valor = _valor_positivo(dados.get("valor"))
+        categoria_id = _categoria_valida(dados.get("categoria_id"), tipo)
+        proxima_data = _data_iso(dados.get("proxima_data"), "próxima data")
+        if store:
+            row = store.fetchrow("INSERT INTO recorrencias (descricao, valor, tipo, categoria_id, frequencia, proxima_data, ativa) VALUES ($1, $2, $3, $4, $5, $6, TRUE) RETURNING id", descricao, valor, tipo, categoria_id, frequencia, proxima_data)
+            return jsonify(_neon_get_recorrencia(row["id"])), 201
+        recorrencia = Recorrencia(descricao=descricao, valor=valor, tipo=tipo, categoria_id=categoria_id, frequencia=frequencia, proxima_data=proxima_data)
         db.session.add(recorrencia)
         db.session.commit()
         return jsonify(recorrencia.to_dict()), 201
     except ValueError as error:
-        db.session.rollback()
+        if not store:
+            db.session.rollback()
         return _erro(str(error))
-
 
 @app.route("/api/recorrencias/<int:rid>/executar", methods=["POST"])
 def api_executar_recorrencia(rid):
+    store = _neon_store()
+    if store:
+        async def executar(connection):
+            recorrencia = await connection.fetchrow("SELECT id, descricao, valor, tipo, categoria_id, frequencia, proxima_data, ativa FROM recorrencias WHERE id = $1 FOR UPDATE", rid)
+            if not recorrencia:
+                raise LookupError("Recorrência não encontrada.")
+            if not recorrencia["ativa"]:
+                raise ValueError("Esta recorrência está pausada.")
+            if recorrencia["proxima_data"] > date.today():
+                raise ValueError("Esta recorrência ainda não está vencida.")
+            transacao = await connection.fetchrow("INSERT INTO transacoes (descricao, valor, data, tipo, categoria_id) VALUES ($1, $2, $3, $4, $5) RETURNING id", recorrencia["descricao"], recorrencia["valor"], recorrencia["proxima_data"], recorrencia["tipo"], recorrencia["categoria_id"])
+            proxima_data = recorrencia["proxima_data"] + FREQUENCIAS[recorrencia["frequencia"]]
+            await connection.execute("UPDATE recorrencias SET proxima_data = $1 WHERE id = $2", proxima_data, rid)
+            return transacao["id"]
+
+        try:
+            transacao_id = store.transaction(executar)
+        except LookupError as error:
+            return _erro(str(error), 404)
+        except ValueError as error:
+            return _erro(str(error))
+        return jsonify({"transacao": _neon_get_transacao(transacao_id), "recorrencia": _neon_get_recorrencia(rid)}), 201
     recorrencia = db.session.get(Recorrencia, rid)
     if not recorrencia:
         return _erro("Recorrência não encontrada.", 404)
@@ -473,28 +722,34 @@ def api_executar_recorrencia(rid):
     db.session.commit()
     return jsonify({"transacao": transacao.to_dict(), "recorrencia": recorrencia.to_dict()}), 201
 
-
 @app.route("/api/recorrencias/<int:rid>", methods=["PATCH", "DELETE"])
 def api_alterar_recorrencia(rid):
-    recorrencia = db.session.get(Recorrencia, rid)
+    store = _neon_store()
+    recorrencia = _neon_get_recorrencia(rid) if store else db.session.get(Recorrencia, rid)
     if not recorrencia:
         return _erro("Recorrência não encontrada.", 404)
     if request.method == "DELETE":
-        db.session.delete(recorrencia)
-        db.session.commit()
+        if store:
+            store.execute("DELETE FROM recorrencias WHERE id = $1", rid)
+        else:
+            db.session.delete(recorrencia)
+            db.session.commit()
         return jsonify({"ok": True})
     try:
         dados = _json_body()
-        ativa = dados.get("ativa", recorrencia.ativa)
+        ativa = dados.get("ativa", recorrencia["ativa"] if store else recorrencia.ativa)
         if not isinstance(ativa, bool):
             raise ValueError("O estado da recorrência deve ser verdadeiro ou falso.")
+        if store:
+            store.execute("UPDATE recorrencias SET ativa = $1 WHERE id = $2", ativa, rid)
+            return jsonify(_neon_get_recorrencia(rid))
         recorrencia.ativa = ativa
         db.session.commit()
         return jsonify(recorrencia.to_dict())
     except ValueError as error:
-        db.session.rollback()
+        if not store:
+            db.session.rollback()
         return _erro(str(error))
-
 
 @app.route("/api/relatorio/categorias")
 def api_relatorio_categorias():
@@ -505,9 +760,15 @@ def api_relatorio_categorias():
     tipo = request.args.get("tipo", "saida")
     if tipo not in TIPOS:
         return _erro("Tipo de transação inválido.")
+    store = _neon_store()
+    if store:
+        rows = store.fetch("""SELECT c.nome, c.icone, c.cor, SUM(t.valor)::float8 AS total
+                               FROM categorias c JOIN transacoes t ON t.categoria_id = c.id
+                               WHERE EXTRACT(MONTH FROM t.data) = $1 AND EXTRACT(YEAR FROM t.data) = $2 AND t.tipo = $3
+                               GROUP BY c.id, c.nome, c.icone, c.cor ORDER BY SUM(t.valor) DESC""", mes, ano, tipo)
+        return jsonify([{"nome": row["nome"], "icone": row["icone"], "cor": row["cor"], "total": round(float(row["total"]), 2)} for row in rows])
     rows = db.session.query(Categoria.nome, Categoria.icone, Categoria.cor, func.sum(Transacao.valor).label("total")).join(Transacao, Transacao.categoria_id == Categoria.id).filter(extract("month", Transacao.data) == mes, extract("year", Transacao.data) == ano, Transacao.tipo == tipo).group_by(Categoria.id).order_by(func.sum(Transacao.valor).desc()).all()
     return jsonify([{"nome": row.nome, "icone": row.icone, "cor": row.cor, "total": round(row.total, 2)} for row in rows])
-
 
 @app.route("/api/relatorio/comparativo")
 def api_relatorio_comparativo():
