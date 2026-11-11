@@ -35,6 +35,27 @@ class FinanceApiTests(unittest.TestCase):
         payload["categoria_id"] = despesa_id
         self.assertEqual(self.client.post("/api/transacoes", json=payload).status_code, 201)
 
+    def test_transacao_cria_consulta_e_remove(self):
+        with app.app_context():
+            categoria_id = self.despesa.id
+        criada = self.client.post("/api/transacoes", json={"descricao": "Despesa de teste", "valor": 32.5, "data": "2026-05-02", "tipo": "saida", "categoria_id": categoria_id})
+        self.assertEqual(criada.status_code, 201)
+        transacao_id = criada.json["id"]
+        consultada = self.client.get(f"/api/transacoes/{transacao_id}")
+        self.assertEqual(consultada.json["descricao"], "Despesa de teste")
+        removida = self.client.delete(f"/api/transacoes/{transacao_id}")
+        self.assertEqual(removida.status_code, 200)
+        self.assertEqual(self.client.get(f"/api/transacoes/{transacao_id}").status_code, 404)
+
+    def test_meta_salva_e_atualiza_mes_ano(self):
+        primeiro = self.client.post("/api/metas", json={"mes": 12, "ano": 2026, "limite_gastos": 2500, "meta_receita": 5000})
+        self.assertEqual(primeiro.status_code, 200)
+        segundo = self.client.post("/api/metas", json={"mes": 12, "ano": 2026, "limite_gastos": 3000, "meta_receita": 6000})
+        self.assertEqual(segundo.status_code, 200)
+        meta = self.client.get("/api/metas?mes=12&ano=2026").json
+        self.assertEqual(meta["limite_gastos"], 3000)
+        self.assertEqual(meta["meta_receita"], 6000)
+
     def test_busca_filtro_paginacao_e_resumo(self):
         with app.app_context():
             categoria_id = self.despesa.id
