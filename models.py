@@ -27,6 +27,7 @@ class Transacao(db.Model):
     data = db.Column(db.Date, nullable=False, default=date.today)
     tipo = db.Column(db.String(10), nullable=False)
     categoria_id = db.Column(db.Integer, db.ForeignKey("categorias.id"), nullable=True)
+    user_id = db.Column(db.Uuid(as_uuid=False), nullable=True, index=True)
     criado_em = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     def to_dict(self):
@@ -51,7 +52,8 @@ class Meta(db.Model):
     ano = db.Column(db.Integer, nullable=False)
     limite_gastos = db.Column(db.Float, nullable=False, default=0.0)
     meta_receita = db.Column(db.Float, nullable=False, default=0.0)
-    __table_args__ = (db.UniqueConstraint("mes", "ano", name="uq_meta_mes_ano"),)
+    user_id = db.Column(db.Uuid(as_uuid=False), nullable=True, index=True)
+    __table_args__ = (db.UniqueConstraint("user_id", "mes", "ano", name="uq_metas_owner_period"),)
 
     def to_dict(self):
         return {"id": self.id, "mes": self.mes, "ano": self.ano, "limite_gastos": self.limite_gastos, "meta_receita": self.meta_receita}
@@ -65,8 +67,9 @@ class OrcamentoCategoria(db.Model):
     mes = db.Column(db.Integer, nullable=False)
     ano = db.Column(db.Integer, nullable=False)
     limite = db.Column(db.Float, nullable=False)
+    user_id = db.Column(db.Uuid(as_uuid=False), nullable=True, index=True)
     categoria = db.relationship("Categoria")
-    __table_args__ = (db.UniqueConstraint("categoria_id", "mes", "ano", name="uq_orcamento_categoria_mes"),)
+    __table_args__ = (db.UniqueConstraint("user_id", "categoria_id", "mes", "ano", name="uq_orcamentos_owner_category_period"),)
 
 
 class Recorrencia(db.Model):
@@ -80,6 +83,7 @@ class Recorrencia(db.Model):
     frequencia = db.Column(db.String(10), nullable=False)
     proxima_data = db.Column(db.Date, nullable=False)
     ativa = db.Column(db.Boolean, nullable=False, default=True)
+    user_id = db.Column(db.Uuid(as_uuid=False), nullable=True, index=True)
     categoria = db.relationship("Categoria")
 
     def to_dict(self):

@@ -92,6 +92,6 @@ async function carregarTransacoes(page = 1) {
 }
 ['f-mes','f-ano','f-tipo'].forEach(id => document.getElementById(id).addEventListener('change', () => carregarTransacoes(1)));
 document.getElementById('f-busca').addEventListener('input', debounce(() => carregarTransacoes(1), 250));
-carregarTransacoes();
+runWhenAuthenticated(() => carregarTransacoes());
 </script>
 {% endblock %}

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content="Organize receitas, despesas, metas e orçamentos em um só lugar com o FinançasPro.">
   <meta name="theme-color" content="#0d1117">
+  <meta name="neon-auth-url" content="{{ neon_auth_url }}">
   <title>{% block title %}FinançasPro{% endblock %}</title>
 
   <!-- Fonts -->
@@ -19,7 +20,8 @@
 
   {% block extra_head %}{% endblock %}
 </head>
-<body>
+<body class="auth-pending" data-auth-required="true">
+  <div class="auth-loader" id="auth-loader" role="status" aria-live="polite">Verificando sua sessão…</div>
 
   <!-- ── SIDEBAR ─────────────────────────────────── -->
   <aside class="sidebar" id="sidebar">
@@ -53,8 +55,9 @@
 
     <div class="sidebar-footer">
       <div class="user-pill">
-        <div class="user-avatar">U</div>
-        <span>Usuário</span>
+        <div class="user-avatar" id="auth-avatar" aria-hidden="true">U</div>
+        <span class="user-email" id="auth-user-email">Conta</span>
+        <button class="user-logout" type="button" data-auth-sign-out>Sair</button>
       </div>
     </div>
   </aside>
@@ -76,7 +79,8 @@
   <!-- ── OVERLAY (mobile) ──────────────────────── -->
   <div class="sidebar-overlay" id="sidebarOverlay" onclick="toggleSidebar()"></div>
 
-  <!-- Main JS -->
+  <!-- Authentication and shared app scripts -->
+  <script src="{{ url_for('static', filename='js/auth.js') }}"></script>
   <script src="{{ url_for('static', filename='js/main.js') }}"></script>
   {% block extra_scripts %}{% endblock %}
 </body>

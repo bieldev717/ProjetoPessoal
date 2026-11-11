@@ -17,6 +17,6 @@ async function salvarRecorrencia(event){event.preventDefault();const body={descr
 async function executar(id){const response=await fetch(`/api/recorrencias/${id}/executar`,{method:'POST'}),data=await response.json();if(!response.ok){showToast(data.erro||'Não foi possível registrar.','error');return;}showToast('Transação registrada.','success');carregarRecorrencias();}
 async function alternar(id,ativa){const response=await fetch(`/api/recorrencias/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({ativa})});if(response.ok)carregarRecorrencias();else showToast('Não foi possível atualizar.','error');}
 async function remover(id){if(!confirm('Excluir esta recorrência?'))return;const response=await fetch(`/api/recorrencias/${id}`,{method:'DELETE'});if(response.ok){showToast('Recorrência excluída.','success');carregarRecorrencias();}else showToast('Não foi possível excluir.','error');}
-carregarRecorrencias();
+runWhenAuthenticated(() => carregarRecorrencias());
 </script>
 {% endblock %}
