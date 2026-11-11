@@ -116,6 +116,17 @@
     </div>
   </div>
 </div>
+
+<div class="card glass meta-form-card">
+  <h2 class="section-title">Orçamento por categoria</h2>
+  <p class="page-sub">Defina limites mensais para cada tipo de despesa e acompanhe o consumo.</p>
+  <form id="form-orcamento" onsubmit="salvarOrcamento(event)" class="budget-form">
+    <div class="form-group"><label for="o-categoria">Categoria</label><select id="o-categoria" class="form-input" required><option value="">Selecione…</option>{% for c in categorias %}<option value="{{ c.id }}">{{ c.icone }} {{ c.nome }}</option>{% endfor %}</select></div>
+    <div class="form-group"><label for="o-limite">Limite (R$)</label><input id="o-limite" class="form-input" type="number" min="0.01" step="0.01" required placeholder="0,00"></div>
+    <button class="btn btn-primary" type="submit">Salvar limite</button>
+  </form>
+  <div id="orcamentos-lista" class="budget-list" aria-live="polite"></div>
+</div>
 {% endblock %}
 
 {% block extra_scripts %}
@@ -185,8 +196,19 @@ async function salvarMeta(e) {
   }
 }
 
-document.getElementById('sel-mes').addEventListener('change', carregarMeta);
-document.getElementById('sel-ano').addEventListener('change', carregarMeta);
-carregarMeta();
+async function carregarOrcamentos() {
+  const mes=document.getElementById('sel-mes').value, ano=document.getElementById('sel-ano').value;
+  const response=await fetch(`/api/orcamentos-categoria?mes=${mes}&ano=${ano}`), items=await response.json(), list=document.getElementById('orcamentos-lista');
+  if(!response.ok){list.textContent=items.erro||'Erro ao carregar orçamentos.';return;}
+  if(!items.length){list.innerHTML='<p class="empty-msg">Nenhum limite por categoria neste mês.</p>';return;}
+  list.innerHTML=items.map(item=>{const pct=Math.min(Math.max(item.progresso,0),100);const status=item.ultrapassado?'Limite ultrapassado':item.alerta?'Atenção: próximo do limite':`${item.progresso.toFixed(1)}% utilizado`;return `<div class="budget-row"><div class="budget-row-header"><strong>${safeHtml(item.categoria_icone)} ${safeHtml(item.categoria_nome)}</strong><span>${fmt(item.gasto)} / ${fmt(item.limite)}</span></div><div class="progress-bar"><div class="progress-fill ${item.alerta?'danger':''}" style="width:${pct}%"></div></div><span class="${item.alerta?'budget-warning':'muted'}">${status}</span></div>`;}).join('');
+}
+async function salvarOrcamento(event){
+  event.preventDefault();const response=await fetch('/api/orcamentos-categoria',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mes:+document.getElementById('sel-mes').value,ano:+document.getElementById('sel-ano').value,categoria_id:+document.getElementById('o-categoria').value,limite:document.getElementById('o-limite').value})}),data=await response.json();
+  if(!response.ok){showToast(data.erro||'Erro ao salvar limite.','error');return;}showToast('Limite da categoria salvo.','success');event.target.reset();carregarOrcamentos();
+}
+document.getElementById('sel-mes').addEventListener('change',()=>{carregarMeta();carregarOrcamentos();});
+document.getElementById('sel-ano').addEventListener('change',()=>{carregarMeta();carregarOrcamentos();});
+carregarMeta();carregarOrcamentos();
 </script>
 {% endblock %}
